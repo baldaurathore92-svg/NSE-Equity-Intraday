@@ -1,0 +1,16 @@
+# NSE Real-Time Scanner — Python dependencies
+# ==============================================
+# Install: pip install -r requirements.txt
+
+# Angel One SmartAPI (live broker connection)
+smartapi-python>=1.4.0
+websocket-client>=1.6.0
+
+# TOTP for Angel One login (2FA)
+pyotp>=2.9.0
+
+# HTTP for scrip master download
+requests>=2.31.0
+
+# Beautiful terminal UI (live-updating scanner table)
+rich>=13.0.0

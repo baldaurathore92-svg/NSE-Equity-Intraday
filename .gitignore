@@ -1,0 +1,81 @@
+# ==============================================================
+# Sensitive files — कभी commit मत करें
+# ==============================================================
+
+# Real config with Angel One API credentials
+config.json
+config.*.json
+!config.example.json
+
+# Broker session tokens, saved credentials
+*.token
+*.pem
+.env
+.env.*
+
+# ==============================================================
+# Runtime logs और cache
+# ==============================================================
+logs/
+*.log
+*.jsonl
+scrip_master.json
+
+# ==============================================================
+# Python
+# ==============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# ==============================================================
+# IDE / Editor
+# ==============================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ==============================================================
+# Testing / benchmarking
+# ==============================================================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+benchmark_*.py
+profile_*.py
+_merge.py
+test_config.json
+
+# ==============================================================
+# OS
+# ==============================================================
+Thumbs.db
+desktop.ini

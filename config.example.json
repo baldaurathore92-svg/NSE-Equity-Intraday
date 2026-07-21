@@ -1,0 +1,58 @@
+{
+    "_comment_credentials": "STEP 1: Angel One credentials. Get from smartapi.angelbroking.com → login → 'My Apps'. NEVER commit this file to git.",
+    "angel_one": {
+        "api_key": "YOUR_API_KEY_HERE",
+        "client_code": "YOUR_CLIENT_CODE_HERE",
+        "pin": "YOUR_4_DIGIT_MPIN",
+        "totp_secret": "YOUR_BASE32_TOTP_SECRET"
+    },
+
+    "_comment_symbols": "STEP 2: NSE Cash symbols to scan. Format: SYMBOL-EQ (Angel One convention). Below is Nifty 100. Remove/add as needed.",
+    "symbols": [
+        "RELIANCE-EQ", "TCS-EQ", "HDFCBANK-EQ", "INFY-EQ", "ICICIBANK-EQ",
+        "HINDUNILVR-EQ", "ITC-EQ", "LT-EQ", "SBIN-EQ", "BHARTIARTL-EQ",
+        "KOTAKBANK-EQ", "AXISBANK-EQ", "ASIANPAINT-EQ", "MARUTI-EQ", "BAJFINANCE-EQ",
+        "HCLTECH-EQ", "TITAN-EQ", "WIPRO-EQ", "ULTRACEMCO-EQ", "SUNPHARMA-EQ",
+        "M&M-EQ", "NESTLEIND-EQ", "NTPC-EQ", "TATAMOTORS-EQ", "POWERGRID-EQ",
+        "TECHM-EQ", "ONGC-EQ", "BAJAJFINSV-EQ", "TATASTEEL-EQ", "HDFCLIFE-EQ",
+        "SBILIFE-EQ", "JSWSTEEL-EQ", "INDUSINDBK-EQ", "GRASIM-EQ", "ADANIENT-EQ",
+        "DIVISLAB-EQ", "TATACONSUM-EQ", "HINDALCO-EQ", "DRREDDY-EQ", "CIPLA-EQ",
+        "BAJAJ-AUTO-EQ", "EICHERMOT-EQ", "BRITANNIA-EQ", "HEROMOTOCO-EQ", "UPL-EQ",
+        "ADANIPORTS-EQ", "COALINDIA-EQ", "APOLLOHOSP-EQ", "BPCL-EQ", "IOC-EQ",
+        "DABUR-EQ", "GODREJCP-EQ", "PIDILITIND-EQ", "DMART-EQ", "HAVELLS-EQ",
+        "TATAPOWER-EQ", "LICI-EQ", "TRENT-EQ", "ZOMATO-EQ", "IRCTC-EQ",
+        "VEDL-EQ", "SIEMENS-EQ", "ABB-EQ", "GAIL-EQ", "INDIGO-EQ",
+        "NAUKRI-EQ", "PAYTM-EQ", "SBICARD-EQ", "PFC-EQ", "RECLTD-EQ",
+        "NMDC-EQ", "LTIM-EQ", "SHREECEM-EQ", "BOSCHLTD-EQ", "MARICO-EQ",
+        "COLPAL-EQ", "PEL-EQ", "SHRIRAMFIN-EQ", "MOTHERSON-EQ", "TVSMOTOR-EQ",
+        "TORNTPHARM-EQ", "MUTHOOTFIN-EQ", "BEL-EQ", "HAL-EQ", "PIIND-EQ",
+        "IGL-EQ", "ADANIGREEN-EQ", "ADANIPOWER-EQ", "ATGL-EQ", "SRF-EQ",
+        "CHOLAFIN-EQ", "POLYCAB-EQ", "JINDALSTEL-EQ", "NHPC-EQ", "INDUSTOWER-EQ",
+        "TATACHEM-EQ", "ICICIPRULI-EQ", "ICICIGI-EQ", "AMBUJACEM-EQ", "JIOFIN-EQ"
+    ],
+
+    "_comment_scanner": "STEP 3: Scanner behavior tuning. Defaults are sensible; adjust after paper-trading.",
+    "scanner": {
+        "min_evidence_strength_to_log": 30,
+        "log_signal_states": ["WEAK_LONG", "LONG", "STRONG_LONG", "WEAK_SHORT", "SHORT", "STRONG_SHORT"],
+        "signal_dedup_seconds": 5.0,
+        "ui_refresh_ms": 500,
+        "top_n_display": 10,
+        "signal_log_path": "logs/signals.jsonl",
+        "system_log_path": "logs/scanner.log",
+        "scrip_master_cache_path": "logs/scrip_master.json",
+        "scrip_master_ttl_hours": 24
+    },
+
+    "_comment_engine": "STEP 4: BookDynamicsEngine tuning. Change only after understanding math in book_dynamics_engine.py.",
+    "engine": {
+        "history_seconds": 60,
+        "depth_decay_frac": 0.005,
+        "ema_alpha": 0.3,
+        "threshold_strong": 8.0,
+        "threshold_normal": 5.0,
+        "threshold_weak": 2.0,
+        "spoof_dampener_strength": 0.5,
+        "kill_switch_spread_multiplier": 3.0
+    }
+}
