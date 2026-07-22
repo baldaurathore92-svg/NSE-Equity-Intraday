@@ -1423,6 +1423,25 @@ class ScannerConfig:
     # यह setting 1-core CPU पर hang प्रevent करती है।
     tick_queue_size: int = 20000    # ~2 seconds of NSE peak burst headroom
 
+    # ---- Prediction Tracker (Phase 1: signal accuracy self-validation) ----
+    # हर actionable signal पर price capture, फिर horizon के बाद check करना कि
+    # actual price signal-direction में move हुई या नहीं। यह real-time proof देता है
+    # कि scanner के signals sirf compute-correct हैं या truly predict-correct।
+    prediction_horizons_s: List[float] = field(
+        default_factory=lambda: [30.0, 60.0, 120.0]
+    )
+    # NSE Intraday round-trip cost (brokerage + STT + exch + GST + stamp)
+    # Zerodha/Angel typical: ~0.06% for liquid Nifty stocks
+    transaction_cost_pct: float = 0.0006
+    prediction_log_path: str = "logs/predictions.jsonl"
+    # UI में कौन-सा horizon दिखाना है (JSONL में सारे log होते हैं)
+    prediction_display_horizon_s: float = 60.0
+    # Verdict देने से पहले कम-से-कम इतने samples चाहिए
+    prediction_min_samples_for_verdict: int = 20
+    # Pending prediction अगर इस समय तक भी evaluate न हो, तो force-close
+    # (जैसे symbol trade करना बंद कर दे या feed disconnect हो)
+    prediction_max_pending_age_s: float = 300.0
+
     # Paths
     signal_log_path: str = "logs/signals.jsonl"
     system_log_path: str = "logs/scanner.log"
@@ -1465,6 +1484,18 @@ def load_config(path: str) -> ScannerConfig:
     cfg.ui_refresh_ms = int(sc.get("ui_refresh_ms", 500))
     cfg.top_n_display = int(sc.get("top_n_display", 10))
     cfg.tick_queue_size = int(sc.get("tick_queue_size", 20000))
+    if "prediction_horizons_s" in sc:
+        cfg.prediction_horizons_s = [float(x) for x in sc["prediction_horizons_s"]]
+    if "transaction_cost_pct" in sc:
+        cfg.transaction_cost_pct = float(sc["transaction_cost_pct"])
+    if "prediction_log_path" in sc:
+        cfg.prediction_log_path = sc["prediction_log_path"]
+    if "prediction_display_horizon_s" in sc:
+        cfg.prediction_display_horizon_s = float(sc["prediction_display_horizon_s"])
+    if "prediction_min_samples_for_verdict" in sc:
+        cfg.prediction_min_samples_for_verdict = int(sc["prediction_min_samples_for_verdict"])
+    if "prediction_max_pending_age_s" in sc:
+        cfg.prediction_max_pending_age_s = float(sc["prediction_max_pending_age_s"])
     cfg.signal_log_path = sc.get("signal_log_path", cfg.signal_log_path)
     cfg.system_log_path = sc.get("system_log_path", cfg.system_log_path)
     cfg.scrip_master_cache_path = sc.get("scrip_master_cache_path", cfg.scrip_master_cache_path)
@@ -1563,7 +1594,292 @@ class SignalRecorder:
 
 
 # ---------------------------------------------------------------------------
-# 4. Angel One WebSocket production adapter
+# 4. Prediction Tracker — Signal Accuracy Self-Validation (Phase 1)
+# ---------------------------------------------------------------------------
+
+# जो signal states LONG-side हैं और SHORT-side हैं
+_LONG_STATES  = {"STRONG_LONG", "LONG", "WEAK_LONG"}
+_SHORT_STATES = {"STRONG_SHORT", "SHORT", "WEAK_SHORT"}
+_ACTIONABLE_STATES = _LONG_STATES | _SHORT_STATES
+
+
+@dataclass
+class PendingPrediction:
+    """
+    एक "signal fired, now waiting to check if it was right" record.
+    हर actionable signal पर horizons per एक pending बनती है।
+    """
+    symbol: str
+    state: str                # SignalState.value (e.g. "STRONG_LONG")
+    score: float              # smoothed_score at fire time
+    evidence: float           # evidence_strength at fire time
+    price_at_signal: float    # LTP जब signal fire हुआ
+    ts_fired: float           # timestamp when signal fired (from tick)
+    horizon_seconds: float    # कब evaluate करना है (fire + horizon)
+
+
+@dataclass
+class PredictionStatBucket:
+    """Per-(state, horizon) aggregated accuracy stats. Numeric-only, small."""
+    count:            int   = 0
+    hits:             int   = 0     # directional_return > 0
+    net_hits:         int   = 0     # directional_return > cost (actually profitable)
+    sum_return:       float = 0.0   # sum of directional returns
+    sum_return_sq:    float = 0.0   # for std / Sharpe calculation
+    sum_net_return:   float = 0.0   # after transaction costs
+    max_win:          float = 0.0   # best single prediction (directional)
+    max_loss:         float = 0.0   # worst single prediction (directional)
+    last_return:      float = 0.0   # most recent for trending display
+
+    def add(self, directional_return: float, cost: float) -> None:
+        """directional_return: positive if signal was correct direction."""
+        net = directional_return - cost
+        self.count += 1
+        if directional_return > 0:
+            self.hits += 1
+        if net > 0:
+            self.net_hits += 1
+        self.sum_return += directional_return
+        self.sum_return_sq += directional_return * directional_return
+        self.sum_net_return += net
+        if directional_return > self.max_win:
+            self.max_win = directional_return
+        if directional_return < self.max_loss:
+            self.max_loss = directional_return
+        self.last_return = directional_return
+
+    def hit_rate(self) -> float:
+        return self.hits / self.count if self.count else 0.0
+
+    def net_hit_rate(self) -> float:
+        return self.net_hits / self.count if self.count else 0.0
+
+    def avg_return(self) -> float:
+        return self.sum_return / self.count if self.count else 0.0
+
+    def avg_net_return(self) -> float:
+        return self.sum_net_return / self.count if self.count else 0.0
+
+    def sharpe_proxy(self) -> float:
+        """Rough Sharpe-like ratio (avg_return / std_return). Not annualized."""
+        if self.count < 2:
+            return 0.0
+        avg = self.avg_return()
+        var = (self.sum_return_sq / self.count) - (avg * avg)
+        if var <= 0:
+            return 0.0
+        return avg / (var ** 0.5)
+
+
+class PredictionTracker:
+    """
+    Signal accuracy self-measurement.
+
+    काम कैसे करता है:
+      1. जब actionable signal fire हो (LONG/SHORT states), current price capture
+         और N horizons पर pending predictions create।
+      2. उसी symbol के अगले ticks पर, jab bhi pending की horizon expire हो जाए,
+         current price से difference निकालो — actual return.
+      3. Signal-direction में move हुई तो 'hit', नहीं तो 'miss'.
+      4. Cost deduct करके 'net edge' — actual money-making capacity.
+      5. Sab kuchh JSONL में log होता है (audit trail), और live stats UI में दिखते हैं।
+
+    यह real-time honest feedback देता है — "क्या हमारे signals actually काम करते हैं"।
+    """
+
+    def __init__(
+        self,
+        horizons_s: List[float],
+        transaction_cost_pct: float,
+        log_path: str,
+        max_pending_age_s: float = 300.0,
+    ):
+        self.horizons = sorted(float(h) for h in horizons_s)
+        self.cost = float(transaction_cost_pct)
+        self.log_path = Path(log_path)
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.max_pending_age = float(max_pending_age_s)
+
+        # Pending per symbol — worker thread only, no lock needed for writes
+        self._pending: Dict[str, Deque[PendingPrediction]] = {}
+
+        # Stats per (state, horizon). Read by UI thread → protect with lock.
+        self._stats: Dict[Tuple[str, float], PredictionStatBucket] = {}
+        self._stats_lock = threading.RLock()
+
+        # Ring buffer of recent completed evaluations (for potential future analytics)
+        self._recent_completed: Deque[Dict[str, Any]] = deque(maxlen=2000)
+
+        # JSONL log file
+        self._log_file = None
+        self._log_lock = threading.Lock()
+
+        # Counters (single-writer from worker)
+        self.signals_recorded: int = 0
+        self.predictions_evaluated: int = 0
+        self.predictions_timed_out: int = 0
+
+    # -- Lifecycle --
+
+    def open(self) -> None:
+        self._log_file = open(self.log_path, "a", encoding="utf-8", buffering=1)
+        logger.info("PredictionTracker opened. Log: %s (horizons=%s, cost=%.4f%%)",
+                    self.log_path, self.horizons, self.cost * 100)
+
+    def close(self) -> None:
+        with self._log_lock:
+            if self._log_file is not None:
+                self._log_file.close()
+                self._log_file = None
+
+    # -- Recording (called from worker thread after signal fires) --
+
+    def record_signal(
+        self, symbol: str, state: str, score: float, evidence: float,
+        price: float, ts: float,
+    ) -> None:
+        """Actionable signal fire होते ही हर horizon पर एक pending बनाओ।"""
+        if state not in _ACTIONABLE_STATES:
+            return
+        if price <= 0:
+            return
+        bucket = self._pending.setdefault(symbol, deque())
+        for h in self.horizons:
+            bucket.append(PendingPrediction(
+                symbol=symbol, state=state, score=score, evidence=evidence,
+                price_at_signal=price, ts_fired=ts, horizon_seconds=h,
+            ))
+        self.signals_recorded += 1
+
+    # -- Evaluation (called from worker thread on every tick) --
+
+    def on_tick(self, symbol: str, current_price: float, current_ts: float) -> None:
+        """
+        Symbol के pending predictions में से जो horizon पार कर चुके हैं उन्हें
+        evaluate करो। बाकियों को छोड़ दो।
+        """
+        pending = self._pending.get(symbol)
+        if not pending or current_price <= 0:
+            return
+
+        # Deque को front से scan करते हैं (FIFO order of insertion).
+        # Ready-to-evaluate predictions collect करके एक बार में rebuild करते हैं।
+        # यह approach O(N) है per tick per symbol, N आमतौर पर छोटा (3-30)।
+        ready_indices: List[int] = []
+        for i, pred in enumerate(pending):
+            age = current_ts - pred.ts_fired
+            if age >= pred.horizon_seconds:
+                # Horizon पूरा हुआ — evaluate
+                self._evaluate(pred, current_price, current_ts, timed_out=False)
+                ready_indices.append(i)
+            elif age > self.max_pending_age:
+                # बहुत ज्यादा purani — force close (feed lag या symbol stopped)
+                self._evaluate(pred, current_price, current_ts, timed_out=True)
+                ready_indices.append(i)
+
+        if not ready_indices:
+            return
+
+        # Rebuild deque without the removed indices
+        remove_set = set(ready_indices)
+        new_pending = deque(p for i, p in enumerate(pending) if i not in remove_set)
+        if new_pending:
+            self._pending[symbol] = new_pending
+        else:
+            del self._pending[symbol]
+
+    def _evaluate(
+        self, pred: PendingPrediction, current_price: float,
+        current_ts: float, timed_out: bool,
+    ) -> None:
+        """Evaluate a single expired prediction; update stats + log."""
+        # Raw return: unsigned percentage change from signal price
+        raw_return = (current_price - pred.price_at_signal) / pred.price_at_signal
+
+        # Directional return: sign-flipped for SHORT states so "positive" always
+        # means "signal was correct"
+        if pred.state in _SHORT_STATES:
+            directional_return = -raw_return
+        else:
+            directional_return = raw_return
+
+        # Update in-memory stats
+        bucket_key = (pred.state, pred.horizon_seconds)
+        with self._stats_lock:
+            bucket = self._stats.setdefault(bucket_key, PredictionStatBucket())
+            bucket.add(directional_return, self.cost)
+
+        self.predictions_evaluated += 1
+        if timed_out:
+            self.predictions_timed_out += 1
+
+        # Log to JSONL (audit trail)
+        payload = {
+            "ts_fired":         round(pred.ts_fired, 3),
+            "ts_evaluated":     round(current_ts, 3),
+            "actual_horizon_s": round(current_ts - pred.ts_fired, 3),
+            "target_horizon_s": pred.horizon_seconds,
+            "symbol":           pred.symbol,
+            "state":            pred.state,
+            "score":            round(pred.score, 3),
+            "evidence":         round(pred.evidence, 2),
+            "price_at_signal":  round(pred.price_at_signal, 4),
+            "price_at_horizon": round(current_price, 4),
+            "raw_return_pct":       round(raw_return * 100, 4),
+            "directional_return_pct": round(directional_return * 100, 4),
+            "net_return_pct":       round((directional_return - self.cost) * 100, 4),
+            "is_hit":               directional_return > 0,
+            "is_net_profitable":    (directional_return - self.cost) > 0,
+            "timed_out":            timed_out,
+        }
+        self._recent_completed.append(payload)
+        if self._log_file is not None:
+            with self._log_lock:
+                try:
+                    self._log_file.write(
+                        json.dumps(payload, separators=(",", ":"), default=str) + "\n"
+                    )
+                except Exception as e:
+                    logger.exception("Prediction log write failed: %s", e)
+
+    # -- Read API (UI thread) --
+
+    def get_stats_snapshot(self) -> Dict[Tuple[str, float], PredictionStatBucket]:
+        """Return an immutable snapshot for UI. Read-only for callers."""
+        with self._stats_lock:
+            # Return shallow copies of buckets so UI can read without lock contention
+            return {
+                key: PredictionStatBucket(
+                    count=b.count, hits=b.hits, net_hits=b.net_hits,
+                    sum_return=b.sum_return, sum_return_sq=b.sum_return_sq,
+                    sum_net_return=b.sum_net_return,
+                    max_win=b.max_win, max_loss=b.max_loss,
+                    last_return=b.last_return,
+                )
+                for key, b in self._stats.items()
+            }
+
+    def pending_count(self) -> int:
+        """Total pending predictions across all symbols (best-effort read)."""
+        return sum(len(v) for v in self._pending.values())
+
+    def summary(self) -> str:
+        """One-line aggregate summary for headless / logging."""
+        with self._stats_lock:
+            total = sum(b.count for b in self._stats.values())
+            if total == 0:
+                return "predictions=0"
+            hits = sum(b.hits for b in self._stats.values())
+            net_hits = sum(b.net_hits for b in self._stats.values())
+            net_return = sum(b.sum_net_return for b in self._stats.values()) / total
+            return (f"predictions={total} "
+                    f"hit_rate={hits/total*100:.1f}% "
+                    f"net_hit_rate={net_hits/total*100:.1f}% "
+                    f"avg_net={net_return*100:+.3f}%")
+
+
+# ---------------------------------------------------------------------------
+# 5. Angel One WebSocket production adapter
 #    Parses SmartWebSocketV2's on_data message → MarketSnapshot
 # ---------------------------------------------------------------------------
 
@@ -1903,8 +2219,19 @@ class Scanner:
         self._shutdown_evt = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
 
+        # Phase 1 — Prediction Tracker (signal accuracy self-validation).
+        # Note: attribute name deliberately verbose to avoid shadowing with
+        # the SymbolTracker instance local (`tracker`) inside _process_tick.
+        self._prediction_tracker = PredictionTracker(
+            horizons_s=config.prediction_horizons_s,
+            transaction_cost_pct=config.transaction_cost_pct,
+            log_path=config.prediction_log_path,
+            max_pending_age_s=config.prediction_max_pending_age_s,
+        )
+
     def start(self):
         self._recorder.open()
+        self._prediction_tracker.open()
         # Start processing worker thread (single worker sufficient for GIL-bound Python)
         self._shutdown_evt.clear()
         self._worker_thread = threading.Thread(
@@ -1922,6 +2249,7 @@ class Scanner:
             if self._worker_thread.is_alive():
                 logger.warning("Worker thread did not exit within 5s")
         self._recorder.close()
+        self._prediction_tracker.close()
         logger.info("Scanner stopped. Queue remaining: %d ticks",
                     self._tick_queue.qsize())
 
@@ -2020,6 +2348,14 @@ class Scanner:
                 self._stats.ticks_dropped += 1
                 return
 
+            # ---- INTEGRATION POINT 1: Evaluate pending predictions ----
+            # हर incoming tick पर pehle check karo ki is symbol ke koi pending
+            # prediction (past signal) matured हुआ या नहीं। Current tick की LTP
+            # ही "future price" है उन signals के लिए जो पहले fire हुए थे।
+            self._prediction_tracker.on_tick(
+                tracker.symbol, snapshot.ltp, snapshot.timestamp,
+            )
+
             result = tracker.engine.update(snapshot)
             tracker.tick_count += 1
             tracker.last_ltp = snapshot.ltp
@@ -2049,6 +2385,18 @@ class Scanner:
 
             self._recorder.record(tracker.symbol, result)
             self._stats.signals_logged += 1
+
+            # ---- INTEGRATION POINT 2: Record new prediction ----
+            # Signal fire होते ही, current LTP capture karke pending prediction
+            # बना दो। Aage aane wale ticks पर horizon expire होते ही evaluate होगा।
+            self._prediction_tracker.record_signal(
+                symbol=tracker.symbol,
+                state=state_name,
+                score=result.smoothed_score,
+                evidence=result.evidence_strength,
+                price=snapshot.ltp,
+                ts=snapshot.timestamp,
+            )
 
         except Exception as e:
             self._stats.errors += 1
@@ -2201,15 +2549,124 @@ class ConsoleUI:
             table.add_row("(no signals yet)", "", "", "", "", "", "", "", "", "")
         return table
 
+    def _build_prediction_panel(self) -> Table:
+        """
+        4वाँ panel — signal accuracy self-validation output।
+        हर actionable state के लिए display horizon (default 60s) पर hit rate,
+        avg return, net edge (after costs), और verdict दिखाता है।
+        """
+        cfg = self.scanner.config
+        horizon = cfg.prediction_display_horizon_s
+        min_samples = cfg.prediction_min_samples_for_verdict
+        cost_pct = cfg.transaction_cost_pct * 100.0
+        stats_snap = self.scanner._prediction_tracker.get_stats_snapshot()
+        pending_count = self.scanner._prediction_tracker.pending_count()
+        signals_recorded = self.scanner._prediction_tracker.signals_recorded
+        evaluated = self.scanner._prediction_tracker.predictions_evaluated
+
+        title = (
+            f"📈  Prediction Accuracy @ {int(horizon)}s horizon   "
+            f"(cost model: −{cost_pct:.2f}% round-trip  ·  "
+            f"pending={pending_count}  ·  evaluated={evaluated:,})"
+        )
+        table = Table(
+            title=title,
+            title_style="bold magenta",
+            expand=True,
+            show_lines=False,
+            header_style="bold",
+        )
+        table.add_column("Signal State",  style="cyan",  width=14)
+        table.add_column("Samples",        justify="right", width=8)
+        table.add_column("Hit Rate",       justify="right", width=9)
+        table.add_column("Net Hit %",      justify="right", width=10)
+        table.add_column("Avg Return",     justify="right", width=11)
+        table.add_column("Net Edge",       justify="right", width=10)
+        table.add_column("Best / Worst",   justify="right", width=17)
+        table.add_column("Verdict",        width=20)
+
+        # Fixed row order — LONG side top, SHORT side bottom
+        display_states = [
+            ("STRONG_LONG",  "bold green"),
+            ("LONG",         "green"),
+            ("WEAK_LONG",    "dim green"),
+            ("WEAK_SHORT",   "dim red"),
+            ("SHORT",        "red"),
+            ("STRONG_SHORT", "bold red"),
+        ]
+
+        any_data = False
+        for state, style in display_states:
+            bucket = stats_snap.get((state, horizon))
+            if bucket is None or bucket.count == 0:
+                table.add_row(
+                    Text(state, style=style),
+                    "0", "—", "—", "—", "—", "—", Text("waiting…", style="dim"),
+                )
+                continue
+            any_data = True
+            hit_rate = bucket.hit_rate() * 100.0
+            net_hit_rate = bucket.net_hit_rate() * 100.0
+            avg_ret_pct = bucket.avg_return() * 100.0
+            net_edge_pct = bucket.avg_net_return() * 100.0
+            best = bucket.max_win * 100.0
+            worst = bucket.max_loss * 100.0
+
+            # -- Verdict logic --
+            if bucket.count < min_samples:
+                remaining = min_samples - bucket.count
+                verdict_text = f"need {remaining} more"
+                verdict_style = "dim"
+            elif net_edge_pct > 0.03:
+                verdict_text = "✓ EDGE (profitable)"
+                verdict_style = "bold green"
+            elif net_edge_pct > 0.0:
+                verdict_text = "~ marginal"
+                verdict_style = "yellow"
+            elif net_edge_pct > -0.03:
+                verdict_text = "✗ break-even"
+                verdict_style = "dim red"
+            else:
+                verdict_text = "✗ noise (loss)"
+                verdict_style = "red"
+
+            # Color the numeric cells based on sign
+            avg_ret_style = "green" if avg_ret_pct > 0 else "red"
+            net_edge_style = "bold green" if net_edge_pct > 0.03 else \
+                             "yellow" if net_edge_pct > 0 else \
+                             "red"
+
+            table.add_row(
+                Text(state, style=style),
+                f"{bucket.count:,}",
+                f"{hit_rate:.1f}%",
+                f"{net_hit_rate:.1f}%",
+                Text(f"{avg_ret_pct:+.3f}%", style=avg_ret_style),
+                Text(f"{net_edge_pct:+.3f}%", style=net_edge_style),
+                f"{best:+.2f}% / {worst:+.2f}%",
+                Text(verdict_text, style=verdict_style),
+            )
+
+        if not any_data:
+            table.caption = (
+                f"Waiting for {int(horizon)}s to pass after first actionable signal…  "
+                f"({signals_recorded} signals recorded so far)"
+            )
+            table.caption_style = "dim"
+
+        return table
+
     def _render(self) -> Layout:
         bullish, bearish, stats = self.scanner.snapshot_for_ui()
         n_symbols = len(self.scanner._trackers)  # noqa: safe read
 
         layout = Layout()
+        # 4-section layout: header (fixed 4) + bull/bear/predictions (ratio-based)
         layout.split_column(
             Layout(name="header", size=4),
-            Layout(name="bullish"),
-            Layout(name="bearish"),
+            Layout(name="bullish",     ratio=2),
+            Layout(name="bearish",     ratio=2),
+            Layout(name="predictions", ratio=2),
         )
         layout["header"].update(self._build_stats_header(stats, n_symbols))
         layout["bullish"].update(self._build_side_table(
@@ -2218,6 +2675,7 @@ class ConsoleUI:
         layout["bearish"].update(self._build_side_table(
             bearish, f"🔴  Top {self.scanner.config.top_n_display} Bearish", is_bull=False,
         ))
+        layout["predictions"].update(self._build_prediction_panel())
         return layout
 
     def run(self):
@@ -2485,6 +2943,53 @@ def main() -> int:
     return _scanner_main_wrapper(args)
 
 
+def _print_prediction_breakdown(scanner) -> None:
+    """Headless mode के लिए per-state accuracy breakdown print करता है (हर 30s पर)."""
+    cfg = scanner.config
+    horizon = cfg.prediction_display_horizon_s
+    min_samples = cfg.prediction_min_samples_for_verdict
+    stats_snap = scanner._prediction_tracker.get_stats_snapshot()
+
+    display_states = ["STRONG_LONG", "LONG", "WEAK_LONG",
+                      "WEAK_SHORT", "SHORT", "STRONG_SHORT"]
+
+    # Any data yet?
+    has_any = any(
+        (state, horizon) in stats_snap and stats_snap[(state, horizon)].count > 0
+        for state in display_states
+    )
+    if not has_any:
+        return
+
+    print(f"\n  ── Prediction Accuracy @ {int(horizon)}s "
+          f"(cost −{cfg.transaction_cost_pct*100:.2f}%) ──")
+    header = (f"    {'State':<14} {'N':>6}  {'Hit%':>6}  "
+              f"{'AvgRet':>9}  {'NetEdge':>9}  Verdict")
+    print(header)
+    print("    " + "-" * (len(header) - 4))
+    for state in display_states:
+        b = stats_snap.get((state, horizon))
+        if b is None or b.count == 0:
+            continue
+        hit_pct = b.hit_rate() * 100.0
+        avg_ret = b.avg_return() * 100.0
+        net_edge = b.avg_net_return() * 100.0
+
+        if b.count < min_samples:
+            verdict = f"need {min_samples - b.count} more"
+        elif net_edge > 0.03:
+            verdict = "✓ EDGE"
+        elif net_edge > 0.0:
+            verdict = "~ marginal"
+        elif net_edge > -0.03:
+            verdict = "✗ break-even"
+        else:
+            verdict = "✗ noise"
+        print(f"    {state:<14} {b.count:>6}  {hit_pct:>5.1f}%  "
+              f"{avg_ret:>+8.3f}%  {net_edge:>+8.3f}%  {verdict}")
+    print()
+
+
 def _scanner_main_wrapper(args):
     """Same body as the old _scanner_main() but accepting pre-parsed args."""
     import sys, threading, time, signal as _signal_mod
@@ -2549,14 +3054,24 @@ def _scanner_main_wrapper(args):
                 avg_us, p50_us, p99_us = s.latency_stats_us()
                 bp = s.ticks_dropped_backpressure
                 bp_str = f" ⚠ BACKPRESSURE-DROP={bp:,}" if bp > 0 else ""
+                pt = scanner._prediction_tracker
+                pt_summary = pt.summary()
+                pt_pending = pt.pending_count()
                 print(f"  ticks={s.ticks_received:,} ({s.ticks_per_sec():.0f}/s) "
                       f"signals={s.signals_computed:,} "
                       f"logged={s.signals_logged:,} "
                       f"errors={s.errors}{bp_str}  |  "
                       f"queue={s.queue_depth_current}/{s.queue_depth_max} "
-                      f"latency avg={avg_us:.0f}µs p50={p50_us:.0f}µs "
-                      f"p99={p99_us:.0f}µs max={s.latency_max_us:.0f}µs",
+                      f"latency p50={p50_us:.0f}µs p99={p99_us:.0f}µs  |  "
+                      f"{pt_summary} (pending={pt_pending})",
                       flush=True)
+
+                # -- Periodic per-state breakdown every 30s --
+                if not hasattr(_scanner_main_wrapper, "_last_pt_breakdown"):
+                    _scanner_main_wrapper._last_pt_breakdown = time.time()
+                if time.time() - _scanner_main_wrapper._last_pt_breakdown > 30.0:
+                    _scanner_main_wrapper._last_pt_breakdown = time.time()
+                    _print_prediction_breakdown(scanner)
         else:
             ui = ConsoleUI(scanner, refresh_ms=config.ui_refresh_ms)
             ui_thread = threading.Thread(target=ui.run, name="ui-thread", daemon=True)

@@ -38,10 +38,19 @@
         "signal_dedup_seconds": 5.0,
         "ui_refresh_ms": 500,
         "top_n_display": 10,
+        "tick_queue_size": 20000,
         "signal_log_path": "logs/signals.jsonl",
         "system_log_path": "logs/scanner.log",
         "scrip_master_cache_path": "logs/scrip_master.json",
-        "scrip_master_ttl_hours": 24
+        "scrip_master_ttl_hours": 24,
+
+        "__COMMENT_PREDICTION_TRACKER": "Phase 1 - Signal Accuracy Self-Validation. हर actionable signal पर price capture, फिर N seconds बाद check कि actually correct direction में गयी या नहीं। Real-time proof कि signals predict करते हैं या नहीं। JSONL में सब audit trail।",
+        "prediction_horizons_s": [30.0, 60.0, 120.0],
+        "transaction_cost_pct": 0.0006,
+        "prediction_log_path": "logs/predictions.jsonl",
+        "prediction_display_horizon_s": 60.0,
+        "prediction_min_samples_for_verdict": 20,
+        "prediction_max_pending_age_s": 300.0
     },
 
     "_comment_engine": "STEP 4: BookDynamicsEngine tuning. Change only after understanding math in book_dynamics_engine.py.",

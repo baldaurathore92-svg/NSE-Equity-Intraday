@@ -168,6 +168,53 @@ Composite = Weighted sum → EMA smoothed → `[-10, +10]` score → Signal stat
 
 ---
 
+## 🎯 Phase 1: PredictionTracker (Signal Accuracy Self-Validation)
+
+Scanner **खुद ही measure करता है** कि उसके signals actually बाद में सही निकले या नहीं।
+कोई अंदाज़ा नहीं, कोई backtest hype नहीं — live empirical proof।
+
+**कैसे काम करता है:**
+1. जब actionable signal fire हो (LONG/SHORT states), current LTP capture
+2. Configured horizons (default: 30s / 60s / 120s) पर pending predictions create
+3. उसी symbol के अगले ticks पर, horizon expire होते ही:
+   - Current price vs signal-fire price → directional return
+   - LONG signal + price up = ✓ hit
+   - SHORT signal + price down = ✓ hit
+   - Transaction cost (default 0.06%) deduct करके actual net edge
+4. Per-state × horizon aggregated stats → live UI panel + JSONL audit trail
+
+**UI Panel Example:**
+
+```
+📈  Prediction Accuracy @ 60s horizon  (cost model: −0.06% round-trip)
+┏━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━━┓
+┃ Signal State ┃ Samples┃ Hit %  ┃ AvgRet  ┃ NetEdge ┃ Verdict         ┃
+┡━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━━━━━┩
+│ STRONG_LONG  │    42  │  58.3% │  +0.12% │ +0.06%  │ ✓ EDGE          │
+│ LONG         │   118  │  52.1% │  +0.04% │ -0.02%  │ ✗ break-even    │
+│ WEAK_LONG    │   256  │  49.6% │  +0.01% │ -0.05%  │ ✗ noise (loss)  │
+│ STRONG_SHORT │    38  │  57.8% │  -0.14% │ +0.08%  │ ✓ EDGE          │
+└──────────────┴────────┴────────┴─────────┴─────────┴─────────────────┘
+```
+
+यह real-time proof देता है कि **कौन-सी signal states में असली edge है और कौन-सी में नहीं।**
+अक्सर सिर्फ STRONG_LONG/STRONG_SHORT ही tradeable होंगे, weak signals noise होंगे।
+
+**JSONL output** (`logs/predictions.jsonl`): हर evaluated prediction का पूरा record —
+`ts_fired`, `ts_evaluated`, `symbol`, `state`, `score`, `evidence`,
+`price_at_signal`, `price_at_horizon`, `directional_return_pct`, `net_return_pct`,
+`is_hit`, `is_net_profitable`, `timed_out`.
+
+**Config** (in `config.example.json`):
+```json
+"prediction_horizons_s": [30.0, 60.0, 120.0],
+"transaction_cost_pct": 0.0006,
+"prediction_display_horizon_s": 60.0,
+"prediction_min_samples_for_verdict": 20
+```
+
+---
+
 ## 🛡️ Safety Features
 
 - **Kill switch** — Auto-suppress on spread widening > 3× median
