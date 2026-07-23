@@ -221,8 +221,11 @@ class LiveSignal:
     # Excursions
     max_favorable_excursion: float = 0.0    # best signed return during life
     max_adverse_excursion: float = 0.0      # worst signed return during life
-    time_to_mfe_s: float = 0.0
-    time_to_mae_s: float = 0.0
+    # Sentinel -1.0 means "never happened yet" — distinguishes:
+    #   MFE=0.0, t_mfe=-1.0  → signal never went positive (still losing)
+    #   MFE=0.001, t_mfe=5.0 → best moment was 5s in, at +0.1%
+    time_to_mfe_s: float = -1.0
+    time_to_mae_s: float = -1.0
 
     # Horizon snapshots (filled as each horizon is crossed)
     horizon_snapshots: Dict[float, float] = field(default_factory=dict)
@@ -236,10 +239,9 @@ class LiveSignal:
     def is_currently_winning(self) -> bool:
         return self.current_directional_return > 0
 
-    @property
-    def is_currently_net_profitable(self) -> bool:
-        # cost is not stored here; caller must compare
-        return False
+    def is_currently_net_profitable(self, cost_pct: float) -> bool:
+        """True if current directional return exceeds transaction cost."""
+        return self.current_directional_return > cost_pct
 
     def net_return(self, cost_pct: float) -> float:
         return self.current_directional_return - cost_pct
@@ -346,11 +348,14 @@ class LiveSignalMonitor:
                 sig.seconds_elapsed = elapsed
                 sig.tick_count += 1
 
-                # Update excursions
-                if directional > sig.max_favorable_excursion:
+                # Update excursions.
+                # For MFE: only track values strictly > 0 as "the signal was proved right at some point".
+                # For MAE: only track values strictly < 0.
+                # This way MFE=0.0 with time_to_mfe=-1.0 means "signal never went positive".
+                if directional > 0 and directional > sig.max_favorable_excursion:
                     sig.max_favorable_excursion = directional
                     sig.time_to_mfe_s = elapsed
-                if directional < sig.max_adverse_excursion:
+                if directional < 0 and directional < sig.max_adverse_excursion:
                     sig.max_adverse_excursion = directional
                     sig.time_to_mae_s = elapsed
 
@@ -392,44 +397,86 @@ class LiveSignalMonitor:
 
     def snapshot_open(self, top_n: int = 40) -> List[LiveSignal]:
         """
-        Return snapshot of currently-open signals, sorted by:
-          1. Newest first (recency), then
-          2. Absolute directional return (biggest movers first)
-        Limited to top_n.
+        Return DEEP-COPIED snapshot of currently-open signals, sorted newest-first.
+
+        Deep copy is critical: UI thread renders these while worker thread
+        may be updating fields (current_price, MFE, MAE) simultaneously.
+        Without copy, UI could see torn state (e.g., new price but old
+        directional return computed from previous price).
         """
         with self._lock:
-            # Shallow copy list of open LiveSignals for UI read
-            signals = list(self._open.values())
-        # Sort: newest first
-        signals.sort(key=lambda s: -s.ts_fired)
-        return signals[:top_n]
+            # Create isolated copies while holding the lock — safe read of all fields.
+            # dataclasses.replace creates a proper copy of the dataclass fields.
+            # We also copy the horizon_snapshots dict explicitly (dict is mutable).
+            frozen = []
+            for sig in self._open.values():
+                copy = LiveSignal(
+                    signal_id=sig.signal_id,
+                    symbol=sig.symbol,
+                    state=sig.state,
+                    smoothed_score=sig.smoothed_score,
+                    evidence=sig.evidence,
+                    regime_label=sig.regime_label,
+                    price_at_signal=sig.price_at_signal,
+                    ts_fired=sig.ts_fired,
+                    max_horizon_s=sig.max_horizon_s,
+                    current_price=sig.current_price,
+                    current_directional_return=sig.current_directional_return,
+                    seconds_elapsed=sig.seconds_elapsed,
+                    tick_count=sig.tick_count,
+                    max_favorable_excursion=sig.max_favorable_excursion,
+                    max_adverse_excursion=sig.max_adverse_excursion,
+                    time_to_mfe_s=sig.time_to_mfe_s,
+                    time_to_mae_s=sig.time_to_mae_s,
+                    horizon_snapshots=dict(sig.horizon_snapshots),  # dict copy
+                    is_closed=sig.is_closed,
+                    close_reason=sig.close_reason,
+                )
+                frozen.append(copy)
+        # Sort newest-first (outside lock — safe on isolated list)
+        frozen.sort(key=lambda s: -s.ts_fired)
+        return frozen[:top_n]
 
     def live_verdict(self) -> Dict[str, Any]:
-        """Aggregate 'how are we doing right now?' stats across open signals."""
+        """
+        Aggregate 'how are we doing right now?' stats across open signals.
+
+        Computes all counters INSIDE the lock so worker thread cannot mutate
+        current_directional_return between counts (would give inconsistent
+        winning + losing + flat counts otherwise).
+
+        Notes on definitions:
+          - winning: strictly current_directional_return > 0
+          - losing:  strictly current_directional_return < 0
+          - flat:    exactly 0 (not counted in either — total_open = winning + losing + flat)
+          - hit_rate_pct: winning / total_open × 100
+            (denominator includes flat — same convention as trade-book stats)
+        """
         with self._lock:
-            open_snap = list(self._open.values())
-        if not open_snap:
-            return {
-                "total_open": 0,
-                "winning": 0,
-                "losing": 0,
-                "net_profitable": 0,
-                "hit_rate_pct": 0.0,
-                "net_profit_rate_pct": 0.0,
-                "avg_current_return_pct": 0.0,
-            }
-        winning = sum(1 for s in open_snap if s.current_directional_return > 0)
-        losing = sum(1 for s in open_snap if s.current_directional_return < 0)
-        net_prof = sum(1 for s in open_snap if s.current_directional_return > self.cost)
-        avg = sum(s.current_directional_return for s in open_snap) / len(open_snap)
+            n = len(self._open)
+            if n == 0:
+                return {
+                    "total_open": 0, "winning": 0, "losing": 0, "flat": 0,
+                    "net_profitable": 0,
+                    "hit_rate_pct": 0.0, "net_profit_rate_pct": 0.0,
+                    "avg_current_return_pct": 0.0,
+                }
+            winning = 0; losing = 0; flat = 0; net_prof = 0; total_ret = 0.0
+            for s in self._open.values():
+                r = s.current_directional_return
+                if r > 0: winning += 1
+                elif r < 0: losing += 1
+                else: flat += 1
+                if r > self.cost:
+                    net_prof += 1
+                total_ret += r
         return {
-            "total_open": len(open_snap),
-            "winning": winning,
-            "losing": losing,
+            "total_open": n,
+            "winning": winning, "losing": losing, "flat": flat,
             "net_profitable": net_prof,
-            "hit_rate_pct": winning / len(open_snap) * 100,
-            "net_profit_rate_pct": net_prof / len(open_snap) * 100,
-            "avg_current_return_pct": avg * 100,
+            "hit_rate_pct": winning / n * 100,
+            "net_profit_rate_pct": net_prof / n * 100,
+            "avg_current_return_pct": (total_ret / n) * 100,
         }
 
     def excursion_stats(self) -> Dict[str, Dict[str, Any]]:
@@ -486,14 +533,28 @@ class HitRateAnalyzer:
         log_path: str = "logs/hit_rate_predictions.jsonl",
         max_pending_age_s: float = 600.0,
         min_samples_for_verdict: int = 20,
+        signal_dedup_seconds: float = 5.0,
     ):
         self.horizons = sorted(float(h) for h in horizons_s)
         self.cost = transaction_cost_pct
         self.max_pending_age = max_pending_age_s
         self.min_samples = min_samples_for_verdict
+        self.signal_dedup_seconds = signal_dedup_seconds
 
         self.log_path = Path(log_path)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Dedup state — last recorded signal per (symbol, state)
+        # Same signal firing repeatedly (score above threshold for many ticks)
+        # would create massive duplicate predictions. Dedup: only record if
+        # state changed OR N seconds have passed since last record for this
+        # symbol+state combo.
+        self._dedup_last_ts: Dict[Tuple[str, str], float] = {}
+        self._dedup_last_state: Dict[str, str] = {}
+        self.signals_deduped: int = 0
+
+        # Concurrent access lock (worker updates + UI reads)
+        self._pending_lock = threading.RLock()
 
         # Pending predictions per symbol (per-horizon, for statistical eval)
         self._pending: Dict[str, Deque[PendingPrediction]] = defaultdict(deque)
@@ -544,11 +605,38 @@ class HitRateAnalyzer:
     def record_signal(
         self, symbol: str, result: SignalResult, price: float, ts: float,
     ) -> None:
-        """Called when scanner fires an actionable signal. Creates pending
-        predictions at each configured horizon."""
+        """
+        Called when scanner fires an actionable signal.
+
+        DEDUP RULE (critical): A scanner signal state can persist for many
+        consecutive ticks (e.g., STRONG_LONG stays STRONG_LONG for 60s if
+        book conditions don't reverse). Without dedup, we'd create hundreds
+        of duplicate predictions per symbol per second.
+
+        Recording rules:
+          1. If state changed vs last recorded for this symbol → record
+             (new signal event)
+          2. If same state but > signal_dedup_seconds elapsed → record
+             (treat as fresh signal after cooldown)
+          3. Else → skip (deduped)
+        """
         state = result.state.value
         if state not in _ACTIONABLE_STATES or price <= 0:
             return
+
+        # -- DEDUP GATE --
+        prev_state = self._dedup_last_state.get(symbol)
+        state_changed = (prev_state != state)
+        last_recorded_ts = self._dedup_last_ts.get((symbol, state), 0.0)
+        time_since_last = ts - last_recorded_ts
+
+        if not state_changed and time_since_last < self.signal_dedup_seconds:
+            self.signals_deduped += 1
+            return
+
+        # Update dedup memory (record this event)
+        self._dedup_last_ts[(symbol, state)] = ts
+        self._dedup_last_state[symbol] = state
 
         # Hour of day in IST
         try:
@@ -560,17 +648,18 @@ class HitRateAnalyzer:
         regime_label = getattr(result.metrics.regime, "label", "unknown")
 
         # Create pending at each horizon (for statistical horizon-based eval)
-        for h in self.horizons:
-            self._pending[symbol].append(PendingPrediction(
-                symbol=symbol, state=state,
-                smoothed_score=result.smoothed_score,
-                evidence=result.evidence_strength,
-                regime_label=regime_label,
-                price_at_signal=price,
-                ts_fired=ts,
-                horizon_seconds=h,
-                hour_of_day=hour,
-            ))
+        with self._pending_lock:
+            for h in self.horizons:
+                self._pending[symbol].append(PendingPrediction(
+                    symbol=symbol, state=state,
+                    smoothed_score=result.smoothed_score,
+                    evidence=result.evidence_strength,
+                    regime_label=regime_label,
+                    price_at_signal=price,
+                    ts_fired=ts,
+                    horizon_seconds=h,
+                    hour_of_day=hour,
+                ))
 
         # Also add to live monitor (per-signal, for real-time UI)
         self.live_monitor.add_signal(
@@ -596,25 +685,26 @@ class HitRateAnalyzer:
         # Real-time update (fast, always run)
         self.live_monitor.on_tick(symbol, current_price, current_ts)
 
-        # Horizon-based statistical evaluation
-        pending = self._pending.get(symbol)
-        if not pending or current_price <= 0:
-            return
+        # Horizon-based statistical evaluation (with lock — UI thread also reads pending_count)
+        with self._pending_lock:
+            pending = self._pending.get(symbol)
+            if not pending or current_price <= 0:
+                return
 
-        remaining: Deque[PendingPrediction] = deque()
-        for pred in pending:
-            age = current_ts - pred.ts_fired
-            if age >= pred.horizon_seconds:
-                self._evaluate(pred, current_price, current_ts, timed_out=False)
-            elif age > self.max_pending_age:
-                self._evaluate(pred, current_price, current_ts, timed_out=True)
+            remaining: Deque[PendingPrediction] = deque()
+            for pred in pending:
+                age = current_ts - pred.ts_fired
+                if age >= pred.horizon_seconds:
+                    self._evaluate(pred, current_price, current_ts, timed_out=False)
+                elif age > self.max_pending_age:
+                    self._evaluate(pred, current_price, current_ts, timed_out=True)
+                else:
+                    remaining.append(pred)
+
+            if remaining:
+                self._pending[symbol] = remaining
             else:
-                remaining.append(pred)
-
-        if remaining:
-            self._pending[symbol] = remaining
-        else:
-            del self._pending[symbol]
+                del self._pending[symbol]
 
     def _evaluate(
         self, pred: PendingPrediction, current_price: float,
@@ -690,7 +780,8 @@ class HitRateAnalyzer:
             return {k: HitRateBucket(**v.__dict__) for k, v in self._stats_symbol.items()}
 
     def pending_count(self) -> int:
-        return sum(len(v) for v in self._pending.values())
+        with self._pending_lock:
+            return sum(len(v) for v in self._pending.values())
 
     def verdict(self, bucket: HitRateBucket) -> Tuple[str, str]:
         """Return (verdict_text, verdict_style) for a bucket."""
@@ -960,14 +1051,16 @@ class HitRateUI:
             table.caption_style = "dim"
             return table
 
+        cost_frac = self.analyzer.cost  # already in fractional form, e.g. 0.0006
+
         for sig in signals:
             state_style = self.STATE_STYLE.get(sig.state, "white")
             dir_pct = sig.current_directional_return * 100
             mfe_pct = sig.max_favorable_excursion * 100
             mae_pct = sig.max_adverse_excursion * 100
 
-            # Status determination
-            if sig.current_directional_return > cost_pct / 100:
+            # Status determination (compare fraction-to-fraction, not fraction-to-pct)
+            if sig.current_directional_return > cost_frac:
                 status_text, status_style = "✓✓ PROFITABLE", "bold green"
             elif sig.current_directional_return > 0:
                 status_text, status_style = "✓ winning", "green"
@@ -987,8 +1080,15 @@ class HitRateUI:
                 age_str = f"{m}m{s_}s"
 
             dir_style = "green" if dir_pct > 0 else "red"
-            mfe_style = "green" if mfe_pct > 0 else "dim"
-            mae_style = "red" if mae_pct < 0 else "dim"
+            # Handle "never MFE'd / MAE'd" sentinel — display "—" instead of 0.00%
+            if sig.time_to_mfe_s < 0:
+                mfe_display = Text("—", style="dim")
+            else:
+                mfe_display = Text(f"{mfe_pct:+.2f}%", style="green")
+            if sig.time_to_mae_s < 0:
+                mae_display = Text("—", style="dim")
+            else:
+                mae_display = Text(f"{mae_pct:+.2f}%", style="red")
 
             table.add_row(
                 sig.symbol,
@@ -999,8 +1099,8 @@ class HitRateUI:
                 f"{sig.price_at_signal:.2f}",
                 f"{sig.current_price:.2f}",
                 Text(f"{dir_pct:+.3f}%", style=dir_style),
-                Text(f"{mfe_pct:+.2f}%", style=mfe_style),
-                Text(f"{mae_pct:+.2f}%", style=mae_style),
+                mfe_display,
+                mae_display,
                 Text(status_text, style=status_style),
             )
 
@@ -1223,6 +1323,8 @@ def generate_eod_report(session: LiveHitRateSession, analyzer: HitRateAnalyzer) 
     lines.append(f"  Total ticks         : {session.total_ticks_received:,}")
     lines.append(f"  Signals computed    : {session.total_signals_computed:,}")
     lines.append(f"  Signals recorded    : {analyzer.signals_recorded:,}")
+    lines.append(f"  Signals deduped     : {analyzer.signals_deduped:,}  "
+                 f"(same state within {analyzer.signal_dedup_seconds:.0f}s)")
     lines.append(f"  Predictions evaluated: {analyzer.predictions_evaluated:,}")
     lines.append(f"  Pending (not yet expired): {analyzer.pending_count():,}")
     lines.append(f"  Cost model          : -{analyzer.cost*100:.4f}% round-trip")
@@ -1525,6 +1627,10 @@ Examples:
                    help="Comma-separated symbol subset (default: all from config)")
     p.add_argument("--min-samples", type=int, default=20,
                    help="Minimum samples for confident verdict (default: 20)")
+    p.add_argument("--dedup-seconds", type=float, default=5.0,
+                   help="Signal dedup window in seconds (default: 5.0). "
+                        "Same state fires within this window are ignored to "
+                        "prevent memory/disk blowup during sustained signals.")
     p.add_argument("--log-path", default="logs/hit_rate_predictions.jsonl",
                    help="Path for prediction audit log")
     p.add_argument("--report-path", default="logs/hit_rate_report.txt",
@@ -1592,6 +1698,7 @@ def main() -> int:
         transaction_cost_pct=args.cost_pct,
         log_path=args.log_path,
         min_samples_for_verdict=args.min_samples,
+        signal_dedup_seconds=args.dedup_seconds,
     )
 
     # Build session
