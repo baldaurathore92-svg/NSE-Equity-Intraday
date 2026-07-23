@@ -267,6 +267,92 @@ regime-adaptive value.
 
 ---
 
+## 📊 Live Hit Rate Analyzer (`live_hit_rate_analyzer.py`)
+
+**यह focused standalone tool है जो सिर्फ hit rate measure करने के लिए बना है।**
+No trade simulation, no capital tracking — pure predictive accuracy measurement.
+
+### What It Does
+
+Every actionable signal fire पर current LTP capture, फिर **6 horizons** पर check:
+5s / 15s / 30s / 60s / 120s / 300s। हर horizon पर देखे कि signal-direction में
+price actually moved या नहीं।
+
+### Multi-Dimensional Breakdown
+
+| Dimension | What It Reveals |
+|-----------|-----------------|
+| **By State** (STRONG_LONG / LONG / WEAK_LONG / ...) | कौन-सा signal state predictive है? |
+| **By Horizon** (5s to 300s) | Optimal holding period क्या है? |
+| **By Evidence** (0-30 / 30-50 / 50-70 / 70+) | High-evidence signals बेहतर हैं? |
+| **By Regime** (Phase 2 label) | कौन-सा market regime tradeable है? |
+| **By Hour of Day** (IST) | Opening / mid / closing में accuracy अलग है? |
+| **By Symbol** (top-10 ranked) | कौन-से stocks scanner पर predict करते हैं? |
+
+### Usage
+
+```bash
+# Default 60-min session, rich UI
+python3 live_hit_rate_analyzer.py --config config.json
+
+# Full trading day headless (VPS tmux)
+python3 live_hit_rate_analyzer.py --config config.json --duration-hours 6.5 --no-ui
+
+# Custom horizons + symbols
+python3 live_hit_rate_analyzer.py --config config.json \
+    --horizons 10,30,60,180,600 --symbols RELIANCE-EQ,TCS-EQ,HDFCBANK-EQ
+
+# Custom transaction cost (0.10% instead of default 0.06%)
+python3 live_hit_rate_analyzer.py --config config.json --cost-pct 0.001
+```
+
+### 24/7 systemd Service (VPS)
+
+```bash
+./install_hitrate_service.sh
+sudo systemctl start nse-hitrate-analyzer
+journalctl -u nse-hitrate-analyzer -f
+```
+
+Auto-starts every trading day, auto-stops at 15:30 IST, auto-restarts on crash.
+
+### Sample Output — Real Data EOD Report
+
+```
+══════════════════════════════════════════════════════════════════════════════
+  🎯 HIT RATE BY STATE × HORIZON
+──────────────────────────────────────────────────────────────────────────────
+  State          Horizon    N   Hit %  NetProfit %  AvgRet %  NetEdge %  Verdict
+  ────────────────────────────────────────────────────────────────────────────
+  STRONG_LONG      30s     42   58.3%      52.4%    +0.14%    +0.08%   ✓ edge
+  STRONG_LONG      60s     42   64.3%      59.5%    +0.19%    +0.13%   ✓✓ STRONG EDGE
+  STRONG_LONG     120s     42   61.9%      54.8%    +0.22%    +0.16%   ✓✓ STRONG EDGE
+  LONG             30s    186   51.6%      43.5%    +0.03%   -0.03%   ✗ break-even
+  LONG             60s    186   53.2%      47.3%    +0.06%   +0.00%   ~ marginal
+  WEAK_LONG        60s    412   49.5%      41.7%   -0.01%   -0.07%   ✗ noise
+  ...
+
+  📌 HONEST OVERALL VERDICT
+  ──────────────────────────────────────────────────────────────────────────
+  Total predictions evaluated: 8,432
+  Overall directional hit rate: 51.8%
+  Overall NET profit rate: 44.2% (after 0.06% cost)
+  Average net edge per signal: +0.023%
+
+  🟡 BREAK-EVEN: Signals slightly predictive but cost eats edge.
+     Recommendation: Focus on STRONG_LONG/STRONG_SHORT only, or refine params.
+```
+
+### Output Files
+
+- `logs/hit_rate_predictions.jsonl` — every evaluated prediction (audit trail)
+- `logs/hit_rate_report.txt` — comprehensive EOD text report
+
+**यह tool की USP:** अगर scanner में asli edge है, यह precisely बताएगा
+**कौन-से** state + horizon + regime + hour में। अगर edge नहीं है, तो भी honestly बताएगा।
+
+---
+
 ## 📼 Record→Replay Workflow (Real Tick Backtesting)
 
 **यह सबसे important workflow है for honest strategy validation.**
