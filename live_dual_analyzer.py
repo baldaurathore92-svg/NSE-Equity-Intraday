@@ -86,6 +86,7 @@ from nse_book_scanner import (
     BookDynamicsEngine, DepthLevel, EngineConfig,
     MarketSnapshot, SignalResult, SignalState,
     _LONG_STATES, _SHORT_STATES, _ACTIONABLE_STATES,
+    _STRONG_STATES, _NORMAL_AND_STRONG_STATES,
     AngelOneConnector, AngelOneWSAdapter, ScannerConfig,
     load_config, setup_logging, SMARTAPI_AVAILABLE,
     # Optional signal quality gates (shared across both analyzers):
@@ -1141,6 +1142,13 @@ Examples:
     p.add_argument("--rvol-strict-warmup", action="store_true",
                    help="Block signals/entries during RVOL warm-up.")
 
+    # State filter (STRONG-only / skip-weak) — SHARED across both analyzers
+    p.add_argument("--strong-only", action="store_true",
+                   help="Record + trade ONLY STRONG_LONG + STRONG_SHORT. "
+                        "Skips WEAK/LONG/SHORT entirely. Shared across both.")
+    p.add_argument("--skip-weak", action="store_true",
+                   help="Record + trade STRONG + LONG/SHORT (skip only WEAK).")
+
     # Diagnostic
     p.add_argument("--diagnose", action="store_true")
     p.add_argument("--dump-count", type=int, default=100)
@@ -1269,6 +1277,16 @@ def main() -> int:
         dump_count=args.dump_count,
         dump_path=args.dump_path,
     )
+
+    # -- Apply state filter to BOTH hit_analyzer + paper_executor --
+    if args.strong_only:
+        session.hit_analyzer.allowed_signal_states = set(_STRONG_STATES)
+        session.paper_executor.allowed_signal_states = set(_STRONG_STATES)
+        print(f"  State filter     : STRONG_LONG + STRONG_SHORT (shared)")
+    elif args.skip_weak:
+        session.hit_analyzer.allowed_signal_states = set(_NORMAL_AND_STRONG_STATES)
+        session.paper_executor.allowed_signal_states = set(_NORMAL_AND_STRONG_STATES)
+        print(f"  State filter     : STRONG + LONG/SHORT (WEAK skipped, shared)")
 
     # Prepare (login + tokens)
     if not session.prepare_stages():

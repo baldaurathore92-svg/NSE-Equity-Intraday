@@ -55,6 +55,7 @@ from nse_book_scanner import (
     MarketSnapshot, SignalResult, SignalState,
     RegimeState, RegimeDetector,
     _LONG_STATES, _SHORT_STATES, _ACTIONABLE_STATES,
+    _STRONG_STATES, _NORMAL_AND_STRONG_STATES,
     NSE_CM_EXCHANGE_TYPE, SUBSCRIPTION_MODE_SNAP_QUOTE,
     # For live mode:
     ScannerConfig, load_config, setup_logging,
@@ -639,6 +640,12 @@ class PaperExecutor:
         self.entries_blocked_by_low_rvol: int = 0
         self.entries_allowed_during_rvol_warmup: int = 0
 
+        # -- State filter (default: all actionable, i.e., WEAK/LONG/STRONG) --
+        # Can be restricted to STRONG only or STRONG+LONG/SHORT.
+        # Set via attribute after __init__.
+        self.allowed_signal_states: set = set(_ACTIONABLE_STATES)
+        self.entries_blocked_by_state_filter: int = 0
+
         self.positions: Dict[str, Position] = {}    # symbol → position
         self.closed_trades: List[ClosedTrade] = []
         self.equity_curve: List[Tuple[float, float]] = [(0.0, capital)]
@@ -709,6 +716,13 @@ class PaperExecutor:
         Phase 2 regime-adaptive logic applied here when regime_adaptive=True.
         """
         state = result.state.value
+
+        # ---- STATE FILTER (early, cheap) ----
+        # If user configured allowed_signal_states (e.g., STRONG-only), skip
+        # signals whose state isn't in that set BEFORE any other processing.
+        if state not in self.allowed_signal_states:
+            self.entries_blocked_by_state_filter += 1
+            return
 
         # ---- Phase 2 — Regime-adaptive signal filtering ----
         # Use the regime attached to this signal's metrics
@@ -1209,6 +1223,12 @@ def generate_report(session: PaperTradingSession) -> str:
                  f"  ({'ENABLED' if ex.session_manager else 'gate disabled'})")
     lines.append(f"  Blocked by low RVOL                   : {ex.entries_blocked_by_low_rvol:>7,}"
                  f"  ({'ENABLED @ ' + str(ex.min_rvol) if ex.min_rvol > 0 else 'gate disabled'})")
+    _sf = "all actionable" if ex.allowed_signal_states == set(_ACTIONABLE_STATES) \
+        else ("STRONG only" if ex.allowed_signal_states == set(_STRONG_STATES)
+              else ("STRONG+LONG/SHORT" if ex.allowed_signal_states == set(_NORMAL_AND_STRONG_STATES)
+                    else "custom"))
+    lines.append(f"  Blocked by state filter               : {ex.entries_blocked_by_state_filter:>7,}"
+                 f"  (filter: {_sf})")
     if ex.rvol_calculator is not None:
         lines.append(f"  Entries allowed during RVOL warmup    : {ex.entries_allowed_during_rvol_warmup:>7,}")
     lines.append(f"  Executed trades (round-trip complete) : {n_trades:>7,}")
@@ -1475,6 +1495,13 @@ Examples:
                         "invert signals in MEAN_REVERTING, adapt thresholds & "
                         "size by volatility regime.")
 
+    # -- Signal state filter --
+    p.add_argument("--strong-only", action="store_true",
+                   help="Trade ONLY STRONG_LONG + STRONG_SHORT signals. "
+                        "Skips WEAK/LONG/SHORT entirely.")
+    p.add_argument("--skip-weak", action="store_true",
+                   help="Trade STRONG + LONG/SHORT (skip only WEAK).")
+
     # -- Signal quality gates (OPTIONAL — all default to disabled) --
     p.add_argument("--session-filter", action="store_true",
                    help="Enable NSE session phase filter. Block entries "
@@ -1568,6 +1595,14 @@ Examples:
         scanner_config=scanner_config,
         regime_adaptive=args.regime_adaptive,
     )
+
+    # -- Attach optional state filter (STRONG-only / skip-weak) --
+    if args.strong_only:
+        session.executor.allowed_signal_states = set(_STRONG_STATES)
+        logger.info(f"  State filter   : STRONG_LONG + STRONG_SHORT only")
+    elif args.skip_weak:
+        session.executor.allowed_signal_states = set(_NORMAL_AND_STRONG_STATES)
+        logger.info(f"  State filter   : STRONG + LONG/SHORT (WEAK skipped)")
 
     # -- Attach optional signal-quality gates to executor --
     if args.session_filter:
