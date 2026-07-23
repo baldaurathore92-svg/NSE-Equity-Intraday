@@ -238,33 +238,89 @@ source "$VENV_DIR/bin/activate"
 # ------------------------------------------------------------------
 step "4/6  Python dependencies"
 
-# Check if the critical ones are installed
-NEED_INSTALL="no"
-for pkg in smartapi rich pyotp; do
-    if ! python3 -c "import $pkg" 2>/dev/null; then
-        NEED_INSTALL="yes"
+# The critical import checks (matches what nse_book_scanner.py does at line 1557)
+check_imports() {
+    python3 -c "from SmartApi import SmartConnect" 2>&1
+}
+check_pyotp() {
+    python3 -c "import pyotp" 2>&1
+}
+check_rich() {
+    python3 -c "import rich" 2>&1
+}
+
+# Full install path if anything is missing
+install_all_deps() {
+    info "Installing/upgrading dependencies (may take 2-3 minutes on first run)..."
+    pip install --upgrade pip --quiet 2>&1 | tail -1
+    if [ -f "$CODE_DIR/requirements.txt" ]; then
+        pip install -r "$CODE_DIR/requirements.txt" 2>&1 | tail -5
+    else
+        pip install smartapi-python websocket-client pyotp requests rich 2>&1 | tail -5
+    fi
+}
+
+NEEDS_INSTALL="no"
+for check in "check_imports" "check_pyotp" "check_rich"; do
+    if ! $check >/dev/null 2>&1; then
+        NEEDS_INSTALL="yes"
         break
     fi
 done
 
-if [ "$NEED_INSTALL" = "yes" ]; then
-    info "Installing/upgrading dependencies (may take 2-3 minutes on first run)..."
-    pip install --upgrade pip --quiet 2>&1 | tail -1
-    if [ -f "$CODE_DIR/requirements.txt" ]; then
-        pip install -r "$CODE_DIR/requirements.txt" --quiet 2>&1 | tail -3
-    else
-        pip install --quiet smartapi-python websocket-client pyotp requests rich
-    fi
+if [ "$NEEDS_INSTALL" = "yes" ]; then
+    install_all_deps
     ok "Dependencies installed"
 else
     ok "All dependencies already installed"
 fi
 
-# Verify final import
-if ! python3 -c "from SmartApi.smartConnect import SmartConnect" 2>/dev/null; then
-    warn "smartapi-python import failed — reinstalling..."
-    pip install --force-reinstall --quiet smartapi-python
+# -- FINAL VERIFICATION (with VERBOSE error output on failure) --
+FINAL_ERR="$(check_imports)"
+if [ "$(check_imports >/dev/null 2>&1; echo $?)" != "0" ]; then
+    warn "SmartApi import still failing. Exact error:"
+    echo "$FINAL_ERR" | sed 's|^|      |'
+    echo ""
+    info "Attempt 1: force-reinstall smartapi-python + pyotp..."
+    pip install --force-reinstall --no-cache-dir smartapi-python pyotp 2>&1 | tail -5
+
+    FINAL_ERR="$(check_imports)"
+    if [ "$(check_imports >/dev/null 2>&1; echo $?)" != "0" ]; then
+        warn "Still failing. Exact error:"
+        echo "$FINAL_ERR" | sed 's|^|      |'
+        echo ""
+
+        # Common cause on Python 3.12+: smartapi-python needs latest version
+        # OR some transitive dep needs pinning
+        info "Attempt 2: install known-good deps (may fix Python 3.12+ issues)..."
+        pip install --upgrade --no-cache-dir \
+            'smartapi-python>=1.5.0' \
+            'websocket-client>=1.6.0' \
+            'pyotp>=2.9.0' \
+            'requests>=2.31.0' \
+            'logzero' \
+            'pandas' 2>&1 | tail -5
+
+        FINAL_ERR="$(check_imports)"
+        if [ "$(check_imports >/dev/null 2>&1; echo $?)" != "0" ]; then
+            error "SmartApi import STILL failing after all attempts:"
+            echo "$FINAL_ERR" | sed 's|^|      |'
+            echo ""
+            echo "  DIAGNOSTIC — please share this output with the developer:"
+            echo "  ─────────────────────────────────────────────────"
+            python3 --version
+            echo ""
+            echo "  Installed packages:"
+            pip list 2>/dev/null | grep -iE "smart|pyotp|websocket|logzero|pandas" | sed 's|^|    |'
+            echo ""
+            echo "  Python module search path:"
+            python3 -c "import sys; [print(f'    {p}') for p in sys.path]"
+            echo "  ─────────────────────────────────────────────────"
+            exit 6
+        fi
+    fi
 fi
+ok "SmartApi import verified working"
 
 # ------------------------------------------------------------------
 # 5. Config file check
