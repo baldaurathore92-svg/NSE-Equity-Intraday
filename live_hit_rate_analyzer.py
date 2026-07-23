@@ -106,6 +106,285 @@ IST = timezone(timedelta(hours=5, minutes=30))
 MARKET_OPEN_MINUTES = 9 * 60 + 15    # 09:15 IST
 MARKET_CLOSE_MINUTES = 15 * 60 + 30  # 15:30 IST
 
+# ============================================================
+# 0. REAL-MARKET DEFENSIVE DIAGNOSTICS
+# ============================================================
+#
+# Angel One SmartAPI WebSocket सटीक field names verify किए बिना बनाया गया है।
+# अगर field names अलग हुए, तो messages silently None return करेंगे — user
+# को पता नहीं चलेगा कि data flow नहीं हो रहा। ये classes उसी silent failure
+# से बचाते हैं।
+
+def _diagnose_parse_failure(msg: Dict[str, Any]) -> str:
+    """
+    Analyze WHY AngelOneWSAdapter.parse() returned None.
+    Returns human-readable reason string.
+    """
+    if not isinstance(msg, dict):
+        return "not_a_dict"
+
+    # Common LTP field variants
+    ltp_keys = ["last_traded_price", "ltp", "lastTradedPrice", "LastTradedPrice"]
+    if not any(msg.get(k) for k in ltp_keys):
+        return f"missing_ltp (checked: {ltp_keys})"
+
+    ltp = msg.get("last_traded_price") or msg.get("ltp") or 0
+    try:
+        if float(ltp) <= 0:
+            return f"ltp_non_positive ({ltp!r})"
+    except (TypeError, ValueError):
+        return f"ltp_not_numeric ({type(ltp).__name__}: {ltp!r})"
+
+    # Bid/ask depth
+    bid_keys = ["best_5_buy_data", "bestBids", "buy", "bids"]
+    ask_keys = ["best_5_sell_data", "bestAsks", "sell", "asks"]
+    has_bids = any(msg.get(k) for k in bid_keys)
+    has_asks = any(msg.get(k) for k in ask_keys)
+    if not has_bids and not has_asks:
+        return f"missing_depth (checked bid keys: {bid_keys}, ask keys: {ask_keys})"
+    if not has_bids:
+        return "missing_bids"
+    if not has_asks:
+        return "missing_asks"
+
+    # Check depth structure
+    b = None
+    for k in bid_keys:
+        if msg.get(k):
+            b = msg[k]
+            break
+    if not isinstance(b, list):
+        return f"bids_not_list (type: {type(b).__name__})"
+    if not b:
+        return "bids_empty_list"
+    if not isinstance(b[0], dict):
+        return f"bid_level_not_dict (type: {type(b[0]).__name__})"
+    if "price" not in b[0] and "p" not in b[0] and "Price" not in b[0]:
+        return f"bid_level_missing_price_key (available keys: {list(b[0].keys())})"
+
+    return "unknown_parse_failure"
+
+
+class RawMessageDumper:
+    """
+    Saves first N raw WebSocket messages to a JSONL file for user inspection.
+    Critical for VERIFYING that AngelOneWSAdapter's assumed field names match
+    actual Angel One SmartAPI output on YOUR account/subscription.
+
+    Use --diagnose flag to enable. First 5 messages also echoed to console.
+    """
+
+    def __init__(self, dump_path: Path, max_dumps: int = 100):
+        self.dump_path = Path(dump_path)
+        self.dump_path.parent.mkdir(parents=True, exist_ok=True)
+        self.max_dumps = max_dumps
+        self.dump_count = 0
+        self._file = None
+        self._lock = threading.Lock()
+        self.console_echo_count = 5
+
+    def open(self) -> None:
+        self._file = open(self.dump_path, "w", encoding="utf-8", buffering=1)
+        logger.info("RawMessageDumper opened: %s (first %d messages)",
+                    self.dump_path, self.max_dumps)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._file is not None:
+                self._file.close()
+                self._file = None
+
+    def dump(self, msg: Dict[str, Any], parse_success: bool,
+             parse_reason: str = "") -> None:
+        """Dump a raw message (only until max_dumps reached)."""
+        with self._lock:
+            if self.dump_count >= self.max_dumps or self._file is None:
+                return
+            self.dump_count += 1
+
+            payload = {
+                "seq": self.dump_count,
+                "wall_ts": time.time(),
+                "parse_success": parse_success,
+                "parse_failure_reason": parse_reason if not parse_success else None,
+                "top_level_keys": list(msg.keys()) if isinstance(msg, dict) else None,
+                "raw_message": msg,
+            }
+            try:
+                line = json.dumps(payload, separators=(",", ":"), default=str)
+                self._file.write(line + "\n")
+            except Exception as e:
+                logger.debug("Dump write failed: %s", e)
+
+            # Console echo for first N (helps user immediately)
+            if self.dump_count <= self.console_echo_count:
+                status = "✓ PARSED" if parse_success else f"✗ FAILED: {parse_reason}"
+                keys = list(msg.keys()) if isinstance(msg, dict) else "N/A"
+                print(f"\n[RAW MSG #{self.dump_count}] {status}")
+                print(f"  Top-level keys: {keys}")
+                if isinstance(msg, dict):
+                    for key in ("last_traded_price", "ltp", "best_5_buy_data",
+                                "total_buy_quantity", "exchange_timestamp"):
+                        if key in msg:
+                            val = msg[key]
+                            val_str = str(val)[:80]  # truncate long
+                            print(f"    {key}: {val_str}")
+
+
+class DataFlowHealthMonitor:
+    """
+    Tracks the health of the data pipeline in real-time.
+
+    Detects the two most common real-market failure modes:
+      A) NO messages arriving at all (WebSocket subscription failed)
+      B) Messages arriving but ALL failing to parse (adapter field mismatch)
+
+    Prints loud warnings when problems are detected — silent failure prevented.
+    """
+
+    def __init__(self, expected_symbols_count: int,
+                 first_tick_timeout_s: float = 60.0,
+                 parse_failure_alert_pct: float = 90.0):
+        self.expected_symbols = expected_symbols_count
+        self.first_tick_timeout_s = first_tick_timeout_s
+        self.parse_failure_alert_pct = parse_failure_alert_pct
+
+        self.started_at = time.time()
+        self.msgs_received = 0
+        self.msgs_parsed_ok = 0
+        self.msgs_parse_failed = 0
+        self.parse_failure_reasons: Dict[str, int] = defaultdict(int)
+
+        # Track which symbols received at least one valid tick
+        self.symbols_with_data: set = set()
+        self.first_tick_time: Optional[float] = None
+
+        self._first_tick_alerted = False
+        self._parse_failure_alerted = False
+        self._lock = threading.Lock()
+
+    def record_message(self, symbol: Optional[str],
+                       parse_success: bool, parse_reason: str = "") -> None:
+        with self._lock:
+            self.msgs_received += 1
+            if parse_success and symbol:
+                self.msgs_parsed_ok += 1
+                if self.first_tick_time is None:
+                    self.first_tick_time = time.time()
+                    elapsed = self.first_tick_time - self.started_at
+                    logger.info("✅ FIRST VALID TICK received after %.1fs from %s",
+                                elapsed, symbol)
+                self.symbols_with_data.add(symbol)
+            else:
+                self.msgs_parse_failed += 1
+                if parse_reason:
+                    self.parse_failure_reasons[parse_reason] += 1
+
+    def check_health_and_warn(self) -> None:
+        """Called periodically from health thread. Prints loud warnings."""
+        elapsed = time.time() - self.started_at
+
+        with self._lock:
+            msgs_rx = self.msgs_received
+            msgs_ok = self.msgs_parsed_ok
+            msgs_fail = self.msgs_parse_failed
+            first_tick = self.first_tick_time
+            n_symbols_data = len(self.symbols_with_data)
+
+        # -- Warning A: NO messages arriving --
+        if elapsed >= 30.0 and msgs_rx == 0 and not self._first_tick_alerted:
+            self._first_tick_alerted = True
+            print()
+            print("=" * 72)
+            print("⚠️  DATA FLOW WARNING — Zero WebSocket messages after 30 seconds")
+            print("=" * 72)
+            print("Possible causes:")
+            print("  1. Not in NSE market hours (Mon-Fri 9:15-15:30 IST)")
+            print("  2. Angel One subscription mode incorrect (need SnapQuote=3)")
+            print("  3. Token resolution failed (symbols not in scrip master)")
+            print("  4. Network/firewall blocking WebSocket")
+            print("  5. Angel One session token expired")
+            print()
+            print("Check: journalctl -u nse-hitrate-analyzer -f")
+            print("=" * 72)
+            print()
+
+        # -- Warning B: Messages arriving but NONE parsing --
+        if elapsed >= 30.0 and msgs_rx >= 5 and msgs_ok == 0 and not self._parse_failure_alerted:
+            self._parse_failure_alerted = True
+            print()
+            print("=" * 72)
+            print("🚨 CRITICAL — Messages arriving but 100% parse failure!")
+            print(f"    Messages received: {msgs_rx}, parsed: 0")
+            print("=" * 72)
+            print("This means AngelOneWSAdapter field names DON'T MATCH your")
+            print("Angel One SmartAPI's actual message format.")
+            print()
+            print("Top parse failure reasons:")
+            with self._lock:
+                top = sorted(self.parse_failure_reasons.items(),
+                             key=lambda x: -x[1])[:5]
+            for reason, count in top:
+                print(f"  {count:>4}x  {reason}")
+            print()
+            print("ACTION: Check the raw payload dump (use --diagnose flag):")
+            print("  cat logs/raw_ws_dump.jsonl | head -1 | python3 -m json.tool")
+            print("  → Share output with adapter maintainer to fix field names")
+            print("=" * 72)
+            print()
+
+        # -- Warning C: High parse failure rate (some parse, some don't) --
+        if msgs_rx >= 50 and not self._parse_failure_alerted:
+            fail_pct = msgs_fail / msgs_rx * 100
+            if fail_pct >= self.parse_failure_alert_pct:
+                self._parse_failure_alerted = True
+                print()
+                print("=" * 72)
+                print(f"⚠️  HIGH PARSE FAILURE RATE: {fail_pct:.1f}% "
+                      f"({msgs_fail} of {msgs_rx})")
+                print("=" * 72)
+                print("Some messages parsing OK, most failing. Possible causes:")
+                print("  - Some symbols delivering different message format")
+                print("  - Occasional malformed messages from broker")
+                print("  - Partial payloads during reconnect")
+                print("  Check logs/raw_ws_dump.jsonl for failure examples.")
+                print("=" * 72)
+                print()
+
+    def summary_report_lines(self) -> List[str]:
+        """Lines for the EOD report's data-quality section."""
+        with self._lock:
+            msgs_rx = self.msgs_received
+            msgs_ok = self.msgs_parsed_ok
+            msgs_fail = self.msgs_parse_failed
+            n_symbols = len(self.symbols_with_data)
+            top_reasons = sorted(self.parse_failure_reasons.items(),
+                                 key=lambda x: -x[1])[:5]
+            first_tick = self.first_tick_time
+
+        lines = []
+        lines.append(f"  Raw messages received : {msgs_rx:>10,}")
+        lines.append(f"  Parsed successfully   : {msgs_ok:>10,}  "
+                     f"({msgs_ok/max(msgs_rx,1)*100:.1f}%)")
+        lines.append(f"  Parse failures        : {msgs_fail:>10,}  "
+                     f"({msgs_fail/max(msgs_rx,1)*100:.1f}%)")
+        lines.append(f"  Symbols with data     : {n_symbols:>10,} "
+                     f"of {self.expected_symbols} expected")
+
+        if first_tick:
+            elapsed_to_first = first_tick - self.started_at
+            lines.append(f"  Time to first tick    : {elapsed_to_first:>10.1f} s")
+        else:
+            lines.append("  Time to first tick    :  NEVER RECEIVED  ⚠")
+
+        if top_reasons:
+            lines.append("")
+            lines.append("  Top parse failure reasons:")
+            for reason, count in top_reasons:
+                lines.append(f"    {count:>6,}x  {reason}")
+
+        return lines
+
 
 # ============================================================
 # 1. DATA CLASSES
@@ -849,7 +1128,14 @@ class HitRateAnalyzer:
 class LiveHitRateSession:
     """Ties Angel One WebSocket + BookDynamicsEngine + HitRateAnalyzer."""
 
-    def __init__(self, config: ScannerConfig, analyzer: HitRateAnalyzer):
+    def __init__(
+        self,
+        config: ScannerConfig,
+        analyzer: HitRateAnalyzer,
+        diagnose: bool = False,
+        dump_count: int = 100,
+        dump_path: str = "logs/raw_ws_dump.jsonl",
+    ):
         if not SMARTAPI_AVAILABLE:
             raise ImportError(
                 "smartapi-python not installed. Run:\n"
@@ -875,6 +1161,20 @@ class LiveHitRateSession:
         self._latency_samples: Deque[float] = deque(maxlen=1000)
         self._latency_max = 0.0
 
+        # -- Real-market defensive diagnostics --
+        # Health monitor is ALWAYS on (silent failure prevention).
+        # Dumper is on only when --diagnose is passed (dumps raw payloads).
+        self.health = DataFlowHealthMonitor(
+            expected_symbols_count=len(config.symbols),
+            first_tick_timeout_s=60.0,
+        )
+        self.dumper: Optional[RawMessageDumper] = None
+        if diagnose:
+            self.dumper = RawMessageDumper(Path(dump_path), max_dumps=dump_count)
+
+        # Background health check thread
+        self._health_thread: Optional[threading.Thread] = None
+
         # Shutdown
         self._shutdown_event = threading.Event()
 
@@ -897,20 +1197,47 @@ class LiveHitRateSession:
         try:
             self.total_ticks_received += 1
 
-            token_raw = msg.get("token")
+            # -- Route by token to symbol --
+            token_raw = msg.get("token") if isinstance(msg, dict) else None
             if token_raw is None:
                 self.total_ticks_dropped += 1
+                self.health.record_message(None, False, "missing_token_key")
+                if self.dumper:
+                    self.dumper.dump(msg, False, "missing_token_key")
                 return
-            token = int(token_raw)
+            try:
+                token = int(token_raw)
+            except (TypeError, ValueError):
+                self.total_ticks_dropped += 1
+                self.health.record_message(None, False,
+                                            f"non_numeric_token ({token_raw!r})")
+                if self.dumper:
+                    self.dumper.dump(msg, False, "non_numeric_token")
+                return
             symbol = self.token_to_symbol.get(token)
             if symbol is None:
                 self.total_ticks_dropped += 1
+                self.health.record_message(None, False,
+                                            f"unknown_token ({token})")
+                if self.dumper:
+                    self.dumper.dump(msg, False, "unknown_token")
                 return
 
+            # -- Parse to MarketSnapshot with diagnostic capture --
             snap = AngelOneWSAdapter.parse(msg, symbol)
             if snap is None:
                 self.total_ticks_dropped += 1
+                # Diagnose WHY parse failed
+                reason = _diagnose_parse_failure(msg)
+                self.health.record_message(symbol, False, reason)
+                if self.dumper:
+                    self.dumper.dump(msg, False, reason)
                 return
+
+            # -- Success path --
+            self.health.record_message(symbol, True)
+            if self.dumper:
+                self.dumper.dump(msg, True)
 
             self.symbols_seen.add(symbol)
             self.last_prices[symbol] = snap.ltp
@@ -946,16 +1273,42 @@ class LiveHitRateSession:
 
     def start(self) -> None:
         self.analyzer.open()
+        if self.dumper is not None:
+            self.dumper.open()
         self.started_at = time.time()
+        # Sync health monitor start time
+        self.health.started_at = self.started_at
+
         tokens = list(self.token_to_symbol.keys())
         logger.info("Starting WebSocket for %d tokens…", len(tokens))
         self.connector.start_websocket(tokens, self._on_tick)
 
+        # Start background health monitor thread — checks every 5s,
+        # prints loud warnings if silent failures detected.
+        self._health_thread = threading.Thread(
+            target=self._health_check_loop, name="health-monitor", daemon=True,
+        )
+        self._health_thread.start()
+
+    def _health_check_loop(self) -> None:
+        """Background thread — check data flow health, warn if broken."""
+        while not self._shutdown_event.is_set():
+            time.sleep(5.0)
+            try:
+                self.health.check_health_and_warn()
+            except Exception as e:
+                logger.debug("Health check error: %s", e)
+
     def stop(self) -> None:
+        self._shutdown_event.set()
+        if self._health_thread is not None:
+            self._health_thread.join(timeout=2.0)
         try:
             self.connector.stop()
         except Exception:
             pass
+        if self.dumper is not None:
+            self.dumper.close()
         self.analyzer.close()
 
     def latency_stats(self) -> Tuple[float, float, float]:
@@ -1682,6 +2035,17 @@ Examples:
                    help="Signal dedup window in seconds (default: 5.0). "
                         "Same state fires within this window are ignored to "
                         "prevent memory/disk blowup during sustained signals.")
+
+    # -- Real-market defensive diagnostics --
+    p.add_argument("--diagnose", action="store_true",
+                   help="Save first N raw WebSocket messages to logs/raw_ws_dump.jsonl "
+                        "and echo first 5 to console. CRITICAL for first-time market "
+                        "deployment to verify Angel One field-name assumptions. "
+                        "Recommended for very first live run.")
+    p.add_argument("--dump-count", type=int, default=100,
+                   help="If --diagnose, save this many raw messages (default: 100)")
+    p.add_argument("--dump-path", default="logs/raw_ws_dump.jsonl",
+                   help="Path for raw WS message dump (default: logs/raw_ws_dump.jsonl)")
     p.add_argument("--log-path", default="logs/hit_rate_predictions.jsonl",
                    help="Path for prediction audit log")
     p.add_argument("--report-path", default="logs/hit_rate_report.txt",
@@ -1752,13 +2116,57 @@ def main() -> int:
         signal_dedup_seconds=args.dedup_seconds,
     )
 
-    # Build session
-    session = LiveHitRateSession(config=config, analyzer=analyzer)
+    # Build session (with optional diagnostic dump)
+    session = LiveHitRateSession(
+        config=config, analyzer=analyzer,
+        diagnose=args.diagnose,
+        dump_count=args.dump_count,
+        dump_path=args.dump_path,
+    )
+
+    # -- STARTUP PROGRESS INDICATORS (each stage clearly logged) --
+    print()
+    print("=" * 72)
+    print("  STAGE 1/4 — Logging in to Angel One SmartAPI…")
+    print("=" * 72)
     try:
-        session.prepare()
+        session.connector.login()
+        print("  ✅ Logged in successfully")
     except Exception as e:
-        logger.exception("Angel One login/setup failed: %s", e)
+        print(f"  ❌ Login failed: {e}")
+        logger.exception("Angel One login failed")
         return 4
+
+    print()
+    print("=" * 72)
+    print("  STAGE 2/4 — Loading scrip master + resolving tokens…")
+    print("=" * 72)
+    try:
+        session.connector.load_scrip_master()
+        resolved, missing = session.connector.resolve_tokens()
+        if not resolved:
+            print("  ❌ No symbols resolved! Check config.symbols.")
+            return 4
+        session.token_to_symbol = {t: s for s, t in resolved.items()}
+        print(f"  ✅ Resolved {len(resolved)}/{len(config.symbols)} symbols")
+        if missing:
+            print(f"  ⚠  Missing (skipped): {', '.join(missing[:5])}"
+                  f"{'…' if len(missing) > 5 else ''}")
+    except Exception as e:
+        print(f"  ❌ Token resolution failed: {e}")
+        logger.exception("Token resolution failed")
+        return 4
+
+    if args.diagnose:
+        print()
+        print("=" * 72)
+        print("  🔍 DIAGNOSTIC MODE ACTIVE")
+        print("=" * 72)
+        print(f"  First {args.dump_count} raw WS messages will be saved to:")
+        print(f"    {args.dump_path}")
+        print("  First 5 messages will also print to this console.")
+        print("  Inspect these to verify Angel One field-name assumptions.")
+        print()
 
     # Shutdown handling
     stop_event = threading.Event()
@@ -1771,14 +2179,28 @@ def main() -> int:
     _signal_mod.signal(_signal_mod.SIGTERM, _handle_signal)
 
     # Start session
-    logger.info("═" * 82)
-    logger.info(" ✅ Starting live tracking. Ctrl+C to stop gracefully.")
-    logger.info("═" * 82)
+    print()
+    print("=" * 72)
+    print("  STAGE 3/4 — Starting WebSocket subscription…")
+    print("=" * 72)
     try:
         session.start()
+        print("  ✅ WebSocket subscription initiated")
+        print("     Background health monitor will alert if no data within 30s")
     except Exception as e:
-        logger.exception("Session start failed: %s", e)
+        print(f"  ❌ WebSocket start failed: {e}")
+        logger.exception("Session start failed")
         return 5
+
+    print()
+    print("=" * 72)
+    print("  STAGE 4/4 — Live tracking active. Ctrl+C to stop gracefully.")
+    print("=" * 72)
+    if args.no_ui or not RICH_AVAILABLE:
+        print("  Headless mode — status will print every 10 seconds")
+    else:
+        print("  Rich UI will render below")
+    print()
 
     # Main loop
     max_duration_sec = args.duration_hours * 3600
@@ -1825,9 +2247,32 @@ def main() -> int:
         logger.info("Stopping session…")
         session.stop()
 
-    # EOD report
+    # EOD report — with data quality diagnostic section
     report = generate_eod_report(session, analyzer)
+    # Prepend data-quality section (critical for verifying real-market readiness)
+    quality_lines: List[str] = []
+    quality_lines.append("═" * 82)
+    quality_lines.append("  📶 DATA FLOW QUALITY (from real-market run)")
+    quality_lines.append("═" * 82)
+    quality_lines.extend(session.health.summary_report_lines())
+    quality_lines.append("")
+    if session.health.msgs_parsed_ok == 0 and session.health.msgs_received > 0:
+        quality_lines.append(
+            "  🚨 CRITICAL: 100% parse failure. Adapter field-name mismatch.")
+        quality_lines.append(
+            "     Re-run with --diagnose to inspect actual Angel One payload.")
+    elif session.health.msgs_received == 0:
+        quality_lines.append(
+            "  ⚠  No WebSocket messages received. Check subscription + market hours.")
+    else:
+        quality_lines.append(
+            f"  ✅ Data flow healthy: "
+            f"{session.health.msgs_parsed_ok:,} valid ticks parsed.")
+    quality_lines.append("═" * 82)
+    quality_report = "\n".join(quality_lines) + "\n"
+
     print()
+    print(quality_report)
     print(report)
     print()
 
