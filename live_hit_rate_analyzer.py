@@ -479,8 +479,26 @@ class LiveSignalMonitor:
             "avg_current_return_pct": (total_ret / n) * 100,
         }
 
+    @staticmethod
+    def _true_median(values: List[float]) -> float:
+        """Proper median: for even n, average the two middle values."""
+        n = len(values)
+        if n == 0:
+            return 0.0
+        s = sorted(values)
+        if n % 2 == 1:
+            return s[n // 2]
+        return (s[n // 2 - 1] + s[n // 2]) / 2.0
+
     def excursion_stats(self) -> Dict[str, Dict[str, Any]]:
-        """Aggregate MFE/MAE stats by state — useful for TP/SL calibration."""
+        """
+        Aggregate MFE/MAE stats by state — useful for TP/SL calibration.
+
+        IMPORTANT: time_to_mfe_s / time_to_mae_s sentinel -1.0 means
+        "never happened" — these MUST be excluded from the time averages,
+        otherwise the average is polluted downward and TP calibration
+        hints become misleading.
+        """
         with self._lock:
             closed_snap = list(self.recently_closed)
         if not closed_snap:
@@ -496,18 +514,27 @@ class LiveSignalMonitor:
             n = len(sigs)
             mfes = [s.max_favorable_excursion for s in sigs]
             maes = [s.max_adverse_excursion for s in sigs]
-            times_mfe = [s.time_to_mfe_s for s in sigs]
-            times_mae = [s.time_to_mae_s for s in sigs]
             final_rets = [s.current_directional_return for s in sigs]
+
+            # Exclude sentinels (-1.0 = "never MFE'd/MAE'd") from time averages
+            valid_times_mfe = [s.time_to_mfe_s for s in sigs if s.time_to_mfe_s >= 0]
+            valid_times_mae = [s.time_to_mae_s for s in sigs if s.time_to_mae_s >= 0]
+            n_had_mfe = len(valid_times_mfe)
+            n_had_mae = len(valid_times_mae)
+
             result[state] = {
                 "n": n,
+                "n_had_mfe": n_had_mfe,   # how many signals ever went positive
+                "n_had_mae": n_had_mae,   # how many ever went negative
                 "avg_mfe_pct": (sum(mfes) / n) * 100,
                 "avg_mae_pct": (sum(maes) / n) * 100,
-                "avg_time_to_mfe_s": sum(times_mfe) / n,
-                "avg_time_to_mae_s": sum(times_mae) / n,
+                # Time averages ONLY over signals that actually MFE'd/MAE'd
+                "avg_time_to_mfe_s": (sum(valid_times_mfe) / n_had_mfe) if n_had_mfe else -1.0,
+                "avg_time_to_mae_s": (sum(valid_times_mae) / n_had_mae) if n_had_mae else -1.0,
                 "avg_final_return_pct": (sum(final_rets) / n) * 100,
-                "median_mfe_pct": sorted(mfes)[n // 2] * 100,
-                "median_mae_pct": sorted(maes)[n // 2] * 100,
+                # True median (avg of two middle values for even n)
+                "median_mfe_pct": self._true_median(mfes) * 100,
+                "median_mae_pct": self._true_median(maes) * 100,
             }
         return result
 
@@ -537,9 +564,22 @@ class HitRateAnalyzer:
     ):
         self.horizons = sorted(float(h) for h in horizons_s)
         self.cost = transaction_cost_pct
-        self.max_pending_age = max_pending_age_s
         self.min_samples = min_samples_for_verdict
         self.signal_dedup_seconds = signal_dedup_seconds
+
+        # Guard: max_pending_age MUST be greater than the largest horizon,
+        # otherwise long-horizon predictions would silently timeout before
+        # reaching their evaluation point, biasing all statistics.
+        # We enforce max_pending_age ≥ max_horizon + 30s buffer.
+        max_h = max(self.horizons) if self.horizons else 60.0
+        if max_pending_age_s < max_h + 30.0:
+            logger.warning(
+                "max_pending_age_s (%.1f) is less than max_horizon (%.1f) + 30s buffer. "
+                "Auto-adjusting to %.1f to prevent premature timeouts.",
+                max_pending_age_s, max_h, max_h + 30.0,
+            )
+            max_pending_age_s = max_h + 30.0
+        self.max_pending_age = max_pending_age_s
 
         self.log_path = Path(log_path)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -638,10 +678,12 @@ class HitRateAnalyzer:
         self._dedup_last_ts[(symbol, state)] = ts
         self._dedup_last_state[symbol] = state
 
-        # Hour of day in IST
+        # Hour of day in IST — defensive against malformed timestamps
+        # (OverflowError for years > 9999, OSError on Windows for negatives,
+        # ValueError for other invalid values)
         try:
             hour = datetime.fromtimestamp(ts, tz=IST).hour
-        except (ValueError, OSError):
+        except (ValueError, OSError, OverflowError):
             hour = -1
 
         # Regime label (Phase 2)
@@ -1297,12 +1339,16 @@ def _print_headless_status(session: LiveHitRateSession, analyzer: HitRateAnalyze
             dir_pct = sig.current_directional_return * 100
             age_s = int(sig.seconds_elapsed)
             status = "✓" if dir_pct > cost_pct else "~" if dir_pct > 0 else "✗"
+            # Sentinel-aware MFE/MAE display (matches rich UI behavior)
+            mfe_str = ("      —" if sig.time_to_mfe_s < 0
+                       else f"{sig.max_favorable_excursion*100:+.2f}%")
+            mae_str = ("      —" if sig.time_to_mae_s < 0
+                       else f"{sig.max_adverse_excursion*100:+.2f}%")
             print(f"             {status} {sig.symbol:<14} {sig.state:<12} "
                   f"score={sig.smoothed_score:+.1f}  age={age_s:>3}s  "
                   f"entry={sig.price_at_signal:>8.2f} → now={sig.current_price:>8.2f}  "
                   f"dir_ret={dir_pct:+.3f}%  "
-                  f"MFE={sig.max_favorable_excursion*100:+.2f}% "
-                  f"MAE={sig.max_adverse_excursion*100:+.2f}%")
+                  f"MFE={mfe_str} MAE={mae_str}")
 
 
 def generate_eod_report(session: LiveHitRateSession, analyzer: HitRateAnalyzer) -> str:
@@ -1457,26 +1503,31 @@ def generate_eod_report(session: LiveHitRateSession, analyzer: HitRateAnalyzer) 
     lines.append("")
     exc_stats = analyzer.live_monitor.excursion_stats()
     if exc_stats:
-        lines.append(f"  {'State':<14} {'N':>6} {'Avg MFE %':>11} {'Med MFE %':>11} "
-                     f"{'Avg MAE %':>11} {'Med MAE %':>11} {'t→MFE (s)':>10} "
-                     f"{'Final Ret %':>13}")
+        lines.append(f"  {'State':<14} {'N':>6} {'MFE hit':>8} "
+                     f"{'Avg MFE':>10} {'Med MFE':>10} {'Avg MAE':>10} "
+                     f"{'Med MAE':>10} {'t→MFE (s)':>10} {'Final':>10}")
         lines.append("  " + "-" * (W - 2))
         for state in ["STRONG_LONG", "LONG", "WEAK_LONG",
                       "WEAK_SHORT", "SHORT", "STRONG_SHORT"]:
             s = exc_stats.get(state)
             if s is None:
                 continue
+            # % of signals that ever went positive (had MFE > 0)
+            mfe_hit_pct = (s["n_had_mfe"] / s["n"] * 100) if s["n"] else 0
+            # Handle sentinel: -1.0 means "no signals ever MFE'd"
+            t_mfe_str = "—" if s["avg_time_to_mfe_s"] < 0 else f"{s['avg_time_to_mfe_s']:>7.1f}s"
             lines.append(
-                f"  {state:<14} {s['n']:>6} "
-                f"{s['avg_mfe_pct']:>+10.3f}% {s['median_mfe_pct']:>+10.3f}% "
-                f"{s['avg_mae_pct']:>+10.3f}% {s['median_mae_pct']:>+10.3f}% "
-                f"{s['avg_time_to_mfe_s']:>9.1f} "
-                f"{s['avg_final_return_pct']:>+12.3f}%"
+                f"  {state:<14} {s['n']:>6} {mfe_hit_pct:>6.1f}% "
+                f"{s['avg_mfe_pct']:>+9.3f}% {s['median_mfe_pct']:>+9.3f}% "
+                f"{s['avg_mae_pct']:>+9.3f}% {s['median_mae_pct']:>+9.3f}% "
+                f"{t_mfe_str:>10} "
+                f"{s['avg_final_return_pct']:>+9.3f}%"
             )
         lines.append("")
-        lines.append("  💡 Calibration hint:")
+        lines.append("  💡 Calibration hint (only meaningful when MFE hit rate > 60%):")
         lines.append("     - Set TAKE_PROFIT ≈ median MFE (most trades reach it before decay)")
         lines.append("     - Set STOP_LOSS  ≈ median MAE × 0.7 (avoid stopping out too early)")
+        lines.append("     - 'MFE hit' = % of signals that EVER went positive during their life")
     else:
         lines.append("  (No closed signals yet — need signals to reach max horizon)")
 
