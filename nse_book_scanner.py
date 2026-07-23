@@ -1806,6 +1806,10 @@ _LONG_STATES  = {"STRONG_LONG", "LONG", "WEAK_LONG"}
 _SHORT_STATES = {"STRONG_SHORT", "SHORT", "WEAK_SHORT"}
 _ACTIONABLE_STATES = _LONG_STATES | _SHORT_STATES
 
+# Subset filters — used when users only want high-conviction signals
+_STRONG_STATES = {"STRONG_LONG", "STRONG_SHORT"}
+_NORMAL_AND_STRONG_STATES = {"STRONG_LONG", "LONG", "STRONG_SHORT", "SHORT"}
+
 
 @dataclass
 class PendingPrediction:

@@ -81,6 +81,7 @@ from nse_book_scanner import (
     BookDynamicsEngine, DepthLevel, EngineConfig,
     MarketSnapshot, SignalResult, SignalState,
     _LONG_STATES, _SHORT_STATES, _ACTIONABLE_STATES,
+    _STRONG_STATES, _NORMAL_AND_STRONG_STATES,
     AngelOneConnector, AngelOneWSAdapter, ScannerConfig,
     load_config, setup_logging, SMARTAPI_AVAILABLE,
     # Optional signal quality gates (new):
@@ -889,6 +890,14 @@ class HitRateAnalyzer:
         self.signals_blocked_by_low_rvol: int = 0
         self.signals_allowed_during_rvol_warmup: int = 0
 
+        # -- State filter --
+        # By default all ACTIONABLE states (WEAK/LONG/STRONG on both sides).
+        # User can restrict to STRONG only, or STRONG+LONG (skip WEAK).
+        # Set via attribute after __init__ (kept out of signature to avoid
+        # bloat).
+        self.allowed_signal_states: set = set(_ACTIONABLE_STATES)
+        self.signals_blocked_by_state_filter: int = 0
+
         # Guard: max_pending_age MUST be greater than the largest horizon,
         # otherwise long-horizon predictions would silently timeout before
         # reaching their evaluation point, biasing all statistics.
@@ -984,6 +993,13 @@ class HitRateAnalyzer:
         """
         state = result.state.value
         if state not in _ACTIONABLE_STATES or price <= 0:
+            return
+
+        # -- STATE FILTER --
+        # Skip signals whose state isn't in the user-configured allowed set.
+        # Default: all ACTIONABLE states. User can restrict to STRONG only.
+        if state not in self.allowed_signal_states:
+            self.signals_blocked_by_state_filter += 1
             return
 
         # -- DEDUP GATE --
@@ -1820,6 +1836,12 @@ def generate_eod_report(session: LiveHitRateSession, analyzer: HitRateAnalyzer) 
                  f"({'ENABLED' if analyzer.session_manager else 'gate disabled'})")
     lines.append(f"  Blocked by low RVOL : {analyzer.signals_blocked_by_low_rvol:,}  "
                  f"({'ENABLED @ min=' + str(analyzer.min_rvol) if analyzer.min_rvol > 0 else 'gate disabled'})")
+    _state_filter_desc = "all actionable" if analyzer.allowed_signal_states == set(_ACTIONABLE_STATES) \
+        else ("STRONG only" if analyzer.allowed_signal_states == set(_STRONG_STATES)
+              else ("STRONG+LONG/SHORT" if analyzer.allowed_signal_states == set(_NORMAL_AND_STRONG_STATES)
+                    else "custom: " + ",".join(sorted(analyzer.allowed_signal_states))))
+    lines.append(f"  Blocked by state    : {analyzer.signals_blocked_by_state_filter:,}  "
+                 f"(filter: {_state_filter_desc})")
     if analyzer.rvol_calculator is not None:
         lines.append(f"  RVOL warmup passes  : {analyzer.signals_allowed_during_rvol_warmup:,}  "
                      f"(signals recorded while RVOL still warming up)")
@@ -2199,6 +2221,18 @@ Examples:
                         "(0.6 = tighter tracking, but more noise). "
                         "Lower = smoother but delayed (0.15 = very stable).")
 
+    # -- Signal state filter (which states to record) --
+    p.add_argument("--strong-only", action="store_true",
+                   help="Record ONLY STRONG_LONG + STRONG_SHORT signals. "
+                        "Skips WEAK_LONG/WEAK_SHORT/LONG/SHORT entirely. "
+                        "Best for focused testing of high-conviction signals "
+                        "(user's 44-min data showed STRONG=56%% hit vs "
+                        "WEAK=44%%). Recommended after enough data collection.")
+    p.add_argument("--skip-weak", action="store_true",
+                   help="Record STRONG + LONG/SHORT (i.e., skip only WEAK "
+                        "signals). Middle ground between default (all) and "
+                        "--strong-only.")
+
     # -- Signal quality gates (OPTIONAL — all default to disabled) --
     p.add_argument("--session-filter", action="store_true",
                    help="Enable NSE session phase filter. Signals fired "
@@ -2382,6 +2416,17 @@ def main() -> int:
     # Propagate strict-warmup flag (constructor doesn't take it directly
     # to keep signature small; setting attribute directly is cheap)
     analyzer.strict_rvol_warmup = args.rvol_strict_warmup
+
+    # -- State filter (which signal states to record) --
+    if args.strong_only:
+        analyzer.allowed_signal_states = set(_STRONG_STATES)
+        logger.info(f"  State filter    : STRONG_LONG + STRONG_SHORT only "
+                    f"(WEAK/LONG/SHORT skipped)")
+    elif args.skip_weak:
+        analyzer.allowed_signal_states = set(_NORMAL_AND_STRONG_STATES)
+        logger.info(f"  State filter    : STRONG + LONG/SHORT (WEAK skipped)")
+    else:
+        logger.info(f"  State filter    : all actionable (STRONG + LONG/SHORT + WEAK)")
 
     # Build custom EngineConfig if user overrode thresholds
     engine_config = EngineConfig()
