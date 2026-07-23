@@ -440,6 +440,114 @@ class ClosedTrade:
     hold_seconds: float
 
 
+class CooldownManager:
+    """
+    Whipsaw protection — enforces minimum wait after exit before re-entering
+    same symbol.
+
+    Two cooldown types:
+      - Regular cooldown: after any exit, wait N seconds before entering same
+        symbol (any direction).
+      - Direction-flip cooldown: after exit, entering OPPOSITE direction
+        requires flip_multiplier × cooldown_seconds (usually 2×).
+        Reason: flipping direction right after exit is often noise.
+
+    Post-stop-loss cooldown can be extended (stop_loss_multiplier) — signals
+    right after a stop-out are especially unreliable (market showed us wrong).
+
+    Thread-safe with RLock for shared use across HitRateAnalyzer + PaperExecutor
+    in dual-analyzer mode.
+    """
+
+    def __init__(
+        self,
+        cooldown_seconds: float = 120.0,
+        flip_multiplier: float = 2.0,
+        stop_loss_multiplier: float = 1.5,
+    ):
+        self.cooldown_seconds = cooldown_seconds
+        self.flip_multiplier = flip_multiplier
+        self.stop_loss_multiplier = stop_loss_multiplier
+
+        # Per-symbol last exit tracking
+        self._last_exit_ts: Dict[str, float] = {}
+        self._last_exit_side: Dict[str, str] = {}   # "LONG" or "SHORT"
+        self._last_exit_reason: Dict[str, str] = {}
+
+        # Stats
+        self.total_exits_recorded = 0
+        self.total_entries_blocked = 0
+        self.blocks_by_reason: Dict[str, int] = defaultdict(int)
+
+        self._lock = threading.RLock()
+
+    def record_exit(self, symbol: str, side: str, reason: str, ts: float) -> None:
+        """Called by executor when a position closes."""
+        with self._lock:
+            self._last_exit_ts[symbol] = ts
+            self._last_exit_side[symbol] = side
+            self._last_exit_reason[symbol] = reason
+            self.total_exits_recorded += 1
+
+    def can_enter(self, symbol: str, side: str, ts: float) -> Tuple[bool, str]:
+        """
+        Check if entering `side` on `symbol` at `ts` is allowed.
+        Returns (allowed: bool, reason: str).
+
+        `side` = "LONG" or "SHORT".
+        """
+        with self._lock:
+            last_ts = self._last_exit_ts.get(symbol)
+            if last_ts is None:
+                return True, "no_prior_exit"
+
+            elapsed = ts - last_ts
+            last_side = self._last_exit_side.get(symbol, "")
+            last_reason = self._last_exit_reason.get(symbol, "")
+
+            # Determine required cooldown
+            base = self.cooldown_seconds
+
+            # Direction flip: opposite of last side
+            if last_side and last_side != side:
+                required = base * self.flip_multiplier
+                if elapsed < required:
+                    self.total_entries_blocked += 1
+                    self.blocks_by_reason["direction_flip"] += 1
+                    return False, (f"flip_cooldown ({elapsed:.0f}s < "
+                                   f"{required:.0f}s, last exit was {last_side})")
+
+            # Post stop-loss: longer cooldown
+            if last_reason == "stop_loss":
+                required = base * self.stop_loss_multiplier
+                if elapsed < required:
+                    self.total_entries_blocked += 1
+                    self.blocks_by_reason["post_stop_loss"] += 1
+                    return False, (f"post_sl_cooldown ({elapsed:.0f}s < "
+                                   f"{required:.0f}s)")
+
+            # Regular cooldown (same-direction or first exit reason category)
+            if elapsed < base:
+                self.total_entries_blocked += 1
+                self.blocks_by_reason["regular"] += 1
+                return False, f"cooldown ({elapsed:.0f}s < {base:.0f}s)"
+
+        return True, "cooldown_expired"
+
+    def stats(self) -> Dict[str, Any]:
+        """Snapshot for reporting."""
+        with self._lock:
+            return {
+                "cooldown_seconds": self.cooldown_seconds,
+                "flip_multiplier": self.flip_multiplier,
+                "stop_loss_multiplier": self.stop_loss_multiplier,
+                "symbols_tracked": len(self._last_exit_ts),
+                "total_exits_recorded": self.total_exits_recorded,
+                "total_entries_blocked": self.total_entries_blocked,
+                "blocks_by_reason": dict(self.blocks_by_reason),
+            }
+
+
 class PaperExecutor:
     """
     Simulates order execution and position management.
@@ -448,6 +556,8 @@ class PaperExecutor:
       - Enter on STRONG signals (score ≥ +threshold or ≤ -threshold)
       - Position size: risk_per_trade × capital / stop_loss_distance
       - Slippage: entry at LTP × (1 + slippage_bps for LONG, - for SHORT)
+      - Cooldown: after exit, N seconds before re-entering same symbol
+        (2× for direction flip, 1.5× post stop-loss)
       - Exit reasons:
           1. Signal reverses (LONG position + SHORT signal fires) → exit
           2. Stop-loss hit → exit
@@ -497,6 +607,12 @@ class PaperExecutor:
         self.regime_high_vol_mult = regime_high_vol_threshold_multiplier
         self.regime_high_vol_size = regime_high_vol_size_multiplier
         self.regime_low_vol_mult = regime_low_vol_threshold_multiplier
+
+        # -- Cooldown manager (whipsaw protection) --
+        # Can be shared across multiple executors in dual-analyzer mode.
+        # If None, no cooldown enforcement.
+        self.cooldown: Optional[CooldownManager] = None
+        self.entries_blocked_by_cooldown: int = 0
 
         self.positions: Dict[str, Position] = {}    # symbol → position
         self.closed_trades: List[ClosedTrade] = []
@@ -608,6 +724,14 @@ class PaperExecutor:
         # Determine direction (state may have been inverted by regime logic)
         side = "LONG" if state in _LONG_STATES else "SHORT"
 
+        # -- COOLDOWN CHECK (before slot check) --
+        # After exit, prevent immediate re-entry (whipsaw protection).
+        if self.cooldown is not None:
+            allowed, cd_reason = self.cooldown.can_enter(symbol, side, ts)
+            if not allowed:
+                self.entries_blocked_by_cooldown += 1
+                return
+
         # Slippage-adjusted entry price
         slip = self.slippage_bps / 10000.0
         if side == "LONG":
@@ -710,6 +834,11 @@ class PaperExecutor:
             hold_seconds=ts - pos.entry_ts,
         )
         self.closed_trades.append(trade)
+
+        # -- Record exit to cooldown manager (whipsaw protection) --
+        if self.cooldown is not None:
+            self.cooldown.record_exit(symbol=symbol, side=pos.side,
+                                       reason=reason, ts=ts)
 
         # Update capital + equity curve
         self.capital += net_pnl

@@ -84,6 +84,8 @@ from nse_book_scanner import (
     AngelOneConnector, AngelOneWSAdapter, ScannerConfig,
     load_config, setup_logging, SMARTAPI_AVAILABLE,
 )
+# CooldownManager reused from paper_trader (avoid duplication)
+from paper_trader import CooldownManager
 
 # Optional Rich UI
 try:
@@ -840,11 +842,18 @@ class HitRateAnalyzer:
         max_pending_age_s: float = 600.0,
         min_samples_for_verdict: int = 20,
         signal_dedup_seconds: float = 5.0,
+        cooldown: Optional["CooldownManager"] = None,
     ):
         self.horizons = sorted(float(h) for h in horizons_s)
         self.cost = transaction_cost_pct
         self.min_samples = min_samples_for_verdict
         self.signal_dedup_seconds = signal_dedup_seconds
+
+        # Optional cooldown manager (shared with PaperExecutor in dual mode).
+        # If set, HitRateAnalyzer only records signals that pass cooldown gate
+        # → apples-to-apples comparison with paper trading stats.
+        self.cooldown: Optional["CooldownManager"] = cooldown
+        self.signals_blocked_by_cooldown: int = 0
 
         # Guard: max_pending_age MUST be greater than the largest horizon,
         # otherwise long-horizon predictions would silently timeout before
@@ -952,6 +961,16 @@ class HitRateAnalyzer:
         if not state_changed and time_since_last < self.signal_dedup_seconds:
             self.signals_deduped += 1
             return
+
+        # -- COOLDOWN CHECK (after dedup, before recording) --
+        # Same cooldown as PaperExecutor uses — ensures both analyzers
+        # measure the same set of "tradeable" signals in dual mode.
+        if self.cooldown is not None:
+            side = "LONG" if state in _LONG_STATES else "SHORT"
+            allowed, _ = self.cooldown.can_enter(symbol, side, ts)
+            if not allowed:
+                self.signals_blocked_by_cooldown += 1
+                return
 
         # Update dedup memory (record this event)
         self._dedup_last_ts[(symbol, state)] = ts
