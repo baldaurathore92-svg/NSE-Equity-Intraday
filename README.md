@@ -215,6 +215,119 @@ Scanner **खुद ही measure करता है** कि उसके sig
 
 ---
 
+## 🌀 Phase 2: Regime Detector (`--regime-adaptive`)
+
+Real markets change character throughout the day. What worked in trending regime
+fails in mean-reverting. Phase 2 classifies current regime per-symbol on 3
+dimensions and adapts trading behavior automatically.
+
+### Regime Dimensions
+
+| Dimension | Values | Detection Method |
+|-----------|--------|------------------|
+| **Volatility** | LOW / NORMAL / HIGH | Recent σ vs baseline σ ratio |
+| **Trend** | TRENDING_UP / TRENDING_DOWN / MEAN_REVERTING / RANDOM | Lag-1 autocorrelation of tick returns |
+| **Depth Bias** | BULL_STRUCTURAL / BEAR_STRUCTURAL / BALANCED | Rolling mean of book-wide imbalance |
+
+### Adaptive Behavior
+
+- **RANDOM regime** → Skip signal (no directional edge to exploit)
+- **MEAN_REVERTING regime** → INVERT signal (LONG becomes SHORT, contrarian trade)
+- **HIGH_VOL regime** → Widen entry threshold (1.3×) + halve position size
+- **LOW_VOL regime** → Tighten entry threshold (0.85×) to catch more marginal moves
+- **TRENDING regime** → Use signals as-is (normal directional trade)
+
+### Live Paper Trading on Real Angel One Data
+
+```bash
+# Simulation with Phase 2 (no broker needed)
+python3 paper_trader.py --duration-min 60 --regime-adaptive
+
+# LIVE paper trading on real Angel One WebSocket (during NSE market hours)
+python3 paper_trader.py --feed live --config config.json --duration-min 390 --regime-adaptive
+
+# Aggressive tuning
+python3 paper_trader.py --feed live --config config.json --regime-adaptive \
+    --entry-score 3 --entry-evidence 25
+```
+
+### What Phase 2 Adaptive Does NOT Do
+
+**⚠️ Important honesty:** Phase 2 is not a magic profit switch. In realistic
+simulation, adding `--regime-adaptive` may make results WORSE if the base
+scanner doesn't have real edge. Its actual value is:
+
+1. **Observability** — See exact regime distribution during trading hours
+2. **Risk management** — Auto-reduce size in HIGH_VOL periods
+3. **Real-market alpha discovery** — On real NSE data, mean-reversion inversions
+   may capture actual over-reaction alpha (simulator can't replicate this)
+
+Run on REAL Angel One data for 5-10 days before drawing conclusions about
+regime-adaptive value.
+
+---
+
+## 🎯 How to Test on Real Data (Live Paper Trading)
+
+The realistic simulator is our best offline approximation of NSE, but only
+real data can prove/disprove profitability. Here's how:
+
+### Prerequisites
+
+1. Angel One SmartAPI account with API key + TOTP secret
+2. VPS with 1+ vCPU, 2GB+ RAM in Mumbai region (for lowest latency)
+3. Python 3.9+ and dependencies installed
+
+### Live Paper Trading Setup
+
+```bash
+# 1. Deploy on VPS
+git clone https://github.com/baldaurathore92-svg/NSE-Equity-Intraday.git
+cd NSE-Equity-Intraday
+./deploy_vps.sh   # installs deps, sets timezone, etc.
+
+# 2. Configure credentials
+cp config.example.json config.json
+chmod 600 config.json
+nano config.json   # fill Angel One api_key, client_code, pin, totp_secret
+
+# 3. Start LIVE paper trading (during 9:15-15:30 IST)
+python3 paper_trader.py --feed live --config config.json \
+    --duration-min 390 --regime-adaptive
+
+# Or run in background (tmux) for full trading day:
+tmux new -s paper
+python3 paper_trader.py --feed live --config config.json --duration-min 390 --regime-adaptive
+# Ctrl+B, then D to detach. tmux attach -t paper to reattach.
+```
+
+### What You'll See in the EOD Report
+
+After 6.5 hours of real NSE ticks:
+- Total trades executed (virtual — no real orders placed)
+- Actual hit rate on REAL market data
+- Real signal→price attribution (was scanner right or wrong?)
+- Regime distribution (what NSE actually looks like today)
+- Per-state performance breakdown
+- Comprehensive HONEST verdict (STRONG / MARGINAL / BREAKEVEN / LOSING)
+
+### Interpretation Framework
+
+After 5-10 trading days of live paper trading:
+
+| Result | Meaning | Action |
+|--------|---------|--------|
+| Win rate < 45% | No edge. Realistic. | Do NOT deploy real money. Rebuild strategy. |
+| Win rate 45-52% | Break-even before costs. | Improve signal quality (Phase 3/4). |
+| Win rate 52-58% | Marginal edge exists. | Refine risk management, then test with small capital. |
+| Win rate > 58% | Statistically likely real edge. | Cautiously deploy small capital, keep expanding paper set. |
+
+**Remember:** Even with real edge, retail Level-2 feed has 50-200ms latency vs
+institutional colo (<1ms). Some signals will already be "priced in" by the time
+you see them.
+
+---
+
 ## 🛡️ Safety Features
 
 - **Kill switch** — Auto-suppress on spread widening > 3× median

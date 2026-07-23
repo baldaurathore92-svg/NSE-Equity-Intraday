@@ -40,7 +40,9 @@ import json
 import logging
 import math
 import random
+import signal as _signal_mod
 import sys
+import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field, asdict
@@ -51,8 +53,13 @@ from typing import Deque, Dict, List, Optional, Tuple
 from nse_book_scanner import (
     BookDynamicsEngine, DepthLevel, EngineConfig,
     MarketSnapshot, SignalResult, SignalState,
+    RegimeState, RegimeDetector,
     _LONG_STATES, _SHORT_STATES, _ACTIONABLE_STATES,
     NSE_CM_EXCHANGE_TYPE, SUBSCRIPTION_MODE_SNAP_QUOTE,
+    # For live mode:
+    ScannerConfig, load_config, setup_logging,
+    AngelOneWSAdapter, AngelOneConnector,
+    SMARTAPI_AVAILABLE,
 )
 
 
@@ -295,6 +302,102 @@ class RealisticNSEFeed:
 
 
 # ============================================================
+# 1b. LIVE NSE FEED — Real Angel One WebSocket
+# ============================================================
+
+class LiveNSEFeed:
+    """
+    Bridge from Angel One SmartWebSocketV2 → same callback interface as
+    RealisticNSEFeed. Runs during NSE market hours; each incoming WS message
+    is forwarded to `on_tick_callback` in the same format the paper trader
+    expects (dict with token, prices in paise, best_5_buy/sell_data etc).
+
+    Prerequisite: valid Angel One credentials in config.json.
+    """
+
+    def __init__(
+        self,
+        scanner_config: ScannerConfig,
+        on_tick_callback,
+        max_duration_seconds: float,
+    ):
+        if not SMARTAPI_AVAILABLE:
+            raise ImportError(
+                "smartapi-python + pyotp not installed. Run:\n"
+                "    pip install -r requirements.txt"
+            )
+        self.config = scanner_config
+        self.on_tick = on_tick_callback
+        self.max_duration = max_duration_seconds
+
+        self.connector = AngelOneConnector(scanner_config)
+        self.token_to_symbol: Dict[int, str] = {}
+        self.symbol_to_token: Dict[str, int] = {}
+
+        self.ticks_generated = 0
+        self._shutdown = threading.Event()
+
+    def prepare(self) -> Dict[str, int]:
+        """Login, load scrip master, resolve symbols. Returns symbol→token map."""
+        self.connector.login()
+        self.connector.load_scrip_master()
+        resolved, missing = self.connector.resolve_tokens()
+        if not resolved:
+            raise RuntimeError("No symbols resolved from Angel One scrip master.")
+        self.symbol_to_token = resolved
+        self.token_to_symbol = {t: s for s, t in resolved.items()}
+        logger.info("LiveNSEFeed prepared: %d symbols resolved.", len(resolved))
+        return resolved
+
+    def token_map(self) -> Dict[str, int]:
+        return self.symbol_to_token
+
+    def _on_ws_message(self, msg: Dict) -> None:
+        """
+        WS message ka format Angel One-specific है (paise, exact field names).
+        Yeh method paper trader ke expected format में convert करता है।
+        SmartWebSocketV2 already dict देता है — बस forward कर देते हैं।
+        """
+        try:
+            self.on_tick(msg)
+            self.ticks_generated += 1
+        except Exception as e:
+            logger.exception("LiveNSEFeed on_tick error: %s", e)
+
+    def run(self) -> None:
+        """Blocking: connect WS, subscribe, wait max_duration."""
+        tokens = list(self.symbol_to_token.values())
+        logger.info("Starting live WebSocket for %d tokens, "
+                    "max duration %.0f min...",
+                    len(tokens), self.max_duration / 60.0)
+
+        # Start WS in background thread
+        self.connector.start_websocket(tokens, self._on_ws_message)
+
+        # Wait up to max_duration OR until shutdown flag
+        start = time.perf_counter()
+        try:
+            while not self._shutdown.is_set():
+                elapsed = time.perf_counter() - start
+                if elapsed >= self.max_duration:
+                    logger.info("Max duration reached (%.0f min); stopping.",
+                                self.max_duration / 60.0)
+                    break
+                # Progress update every 60s
+                if int(elapsed) % 60 == 0 and elapsed > 0:
+                    tps = self.ticks_generated / max(elapsed, 1)
+                    logger.info("  Live progress: %.1f min elapsed, "
+                                "%d ticks received, %.1f tps aggregate",
+                                elapsed / 60.0, self.ticks_generated, tps)
+                time.sleep(5.0)
+        finally:
+            self.connector.stop()
+
+    def stop(self) -> None:
+        self._shutdown.set()
+
+
+# ============================================================
 # 2. PAPER TRADE EXECUTION
 # ============================================================
 
@@ -367,6 +470,13 @@ class PaperExecutor:
         max_hold_seconds: float = 300.0,      # 5 min
         trades_log_path: str = "logs/paper_trades.jsonl",
         equity_log_path: str = "logs/paper_equity.csv",
+        # ---- Phase 2 regime-adaptive parameters ----
+        regime_adaptive: bool = False,
+        regime_skip_random: bool = True,      # skip signals in RANDOM regime
+        regime_invert_mean_reverting: bool = True,  # invert LONG↔SHORT in MEAN_REVERTING
+        regime_high_vol_threshold_multiplier: float = 1.3,   # widen entry gate in HIGH_VOL
+        regime_high_vol_size_multiplier: float = 0.5,        # halve position size in HIGH_VOL
+        regime_low_vol_threshold_multiplier: float = 0.85,   # tighten in LOW_VOL
     ):
         self.capital = capital
         self.starting_capital = capital
@@ -379,6 +489,14 @@ class PaperExecutor:
         self.stop_loss_pct = stop_loss_pct
         self.take_profit_pct = take_profit_pct
         self.max_hold = max_hold_seconds
+
+        # Phase 2 regime tuning
+        self.regime_adaptive = regime_adaptive
+        self.regime_skip_random = regime_skip_random
+        self.regime_invert_mean_reverting = regime_invert_mean_reverting
+        self.regime_high_vol_mult = regime_high_vol_threshold_multiplier
+        self.regime_high_vol_size = regime_high_vol_size_multiplier
+        self.regime_low_vol_mult = regime_low_vol_threshold_multiplier
 
         self.positions: Dict[str, Position] = {}    # symbol → position
         self.closed_trades: List[ClosedTrade] = []
@@ -396,6 +514,10 @@ class PaperExecutor:
         self.entries_attempted = 0
         self.entries_rejected_slots = 0
         self.entries_rejected_capital = 0
+        # Regime-related counters (only relevant when regime_adaptive=True)
+        self.regime_rejected_random = 0
+        self.regime_inverted_signals = 0
+        self.regime_high_vol_reject = 0
 
     def open(self) -> None:
         self._trades_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -411,8 +533,48 @@ class PaperExecutor:
             self._equity_log.close()
 
     def on_signal(self, symbol: str, result: SignalResult, ltp: float, ts: float) -> None:
-        """Called when scanner fires an actionable signal for a symbol."""
+        """
+        Called when scanner fires an actionable signal for a symbol.
+        Phase 2 regime-adaptive logic applied here when regime_adaptive=True.
+        """
         state = result.state.value
+
+        # ---- Phase 2 — Regime-adaptive signal filtering ----
+        # Use the regime attached to this signal's metrics
+        regime = result.metrics.regime
+        eff_score_threshold = self.entry_score_threshold
+        position_size_multiplier = 1.0
+
+        if self.regime_adaptive:
+            # 1. Skip if regime not confident yet (warm-up period)
+            if not regime.is_confident:
+                # Still take signals during warm-up but with default thresholds
+                # (Alternative: return here for stricter behavior)
+                pass
+
+            # 2. RANDOM regime → skip (no directional edge)
+            if self.regime_skip_random and regime.is_confident and \
+               regime.trend == "RANDOM":
+                self.regime_rejected_random += 1
+                return
+
+            # 3. MEAN_REVERTING regime → invert LONG↔SHORT (contrarian trade)
+            if self.regime_invert_mean_reverting and regime.is_confident and \
+               regime.trend == "MEAN_REVERTING":
+                if state in _LONG_STATES:
+                    state = state.replace("LONG", "SHORT")
+                elif state in _SHORT_STATES:
+                    state = state.replace("SHORT", "LONG")
+                self.regime_inverted_signals += 1
+
+            # 4. HIGH_VOL → require stronger signal + smaller size
+            if regime.volatility == "HIGH":
+                eff_score_threshold *= self.regime_high_vol_mult
+                position_size_multiplier *= self.regime_high_vol_size
+
+            # 5. LOW_VOL → allow slightly weaker signals
+            elif regime.volatility == "LOW":
+                eff_score_threshold *= self.regime_low_vol_mult
 
         # Signal-driven exit: reverse-side signal on open position
         if symbol in self.positions:
@@ -426,10 +588,12 @@ class PaperExecutor:
         if symbol in self.positions:
             return   # already have position on this symbol
 
-        # Entry criteria
+        # Entry criteria (using effective threshold if regime-adaptive)
         if state not in _ACTIONABLE_STATES:
             return
-        if abs(result.smoothed_score) < self.entry_score_threshold:
+        if abs(result.smoothed_score) < eff_score_threshold:
+            if self.regime_adaptive and regime.volatility == "HIGH":
+                self.regime_high_vol_reject += 1
             return
         if result.evidence_strength < self.entry_min_evidence:
             return
@@ -441,7 +605,7 @@ class PaperExecutor:
             self.entries_rejected_slots += 1
             return
 
-        # Determine direction
+        # Determine direction (state may have been inverted by regime logic)
         side = "LONG" if state in _LONG_STATES else "SHORT"
 
         # Slippage-adjusted entry price
@@ -456,8 +620,9 @@ class PaperExecutor:
             take_profit = entry_price * (1 - self.take_profit_pct)
 
         # Position size: risk_per_trade × capital / stop_loss_distance_in_₹
+        # Apply regime-based position sizing multiplier (e.g., halved in HIGH_VOL)
         stop_distance_rs = abs(entry_price - stop_loss)
-        risk_capital = self.capital * self.risk_per_trade_pct
+        risk_capital = self.capital * self.risk_per_trade_pct * position_size_multiplier
         quantity = int(risk_capital / stop_distance_rs)
         if quantity < 1:
             self.entries_rejected_capital += 1
@@ -587,18 +752,22 @@ class PaperTradingSession:
         entry_score_threshold: float = 5.0,
         entry_min_evidence: float = 40.0,
         seed: int = 42,
+        # ---- Feed selection ----
+        feed_mode: str = "simulate",              # "simulate" | "live"
+        scanner_config: Optional[ScannerConfig] = None,  # Required if feed_mode="live"
+        # ---- Phase 2 regime-adaptive ----
+        regime_adaptive: bool = False,
     ):
         self.symbols = symbols
         self.duration = duration_seconds
         self.rate = ticks_per_sym_per_sec
+        self.feed_mode = feed_mode
 
-        # Per-symbol engine + last-known price
-        self.engines: Dict[str, BookDynamicsEngine] = {
-            s: BookDynamicsEngine(config=EngineConfig()) for s in symbols
-        }
+        # Per-symbol engine + last-known price (will be populated after feed prep)
+        self.engines: Dict[str, BookDynamicsEngine] = {}
         self.last_prices: Dict[str, float] = {}
 
-        # Token → symbol map for the simulator
+        # Token → symbol map (populated based on feed mode)
         self.token_to_symbol: Dict[int, str] = {}
 
         # Executor
@@ -606,24 +775,34 @@ class PaperTradingSession:
             capital=capital,
             entry_score_threshold=entry_score_threshold,
             entry_min_evidence=entry_min_evidence,
+            regime_adaptive=regime_adaptive,
         )
 
-        # Simulator
-        self.feed = RealisticNSEFeed(
-            symbols=symbols, on_tick_callback=self._on_tick,
-            total_duration_seconds=duration_seconds,
-            ticks_per_symbol_per_sec=ticks_per_sym_per_sec,
-            seed=seed,
-        )
-
-        # Populate token map
-        for symbol, token in self.feed.token_map().items():
-            self.token_to_symbol[token] = symbol
+        # ---- Feed setup ----
+        if feed_mode == "live":
+            if scanner_config is None:
+                raise ValueError("scanner_config required for feed_mode='live'")
+            self.feed = LiveNSEFeed(
+                scanner_config=scanner_config,
+                on_tick_callback=self._on_tick,
+                max_duration_seconds=duration_seconds,
+            )
+            # Symbol list comes from scanner_config, not passed symbols list
+            self.symbols = scanner_config.symbols
+        else:
+            self.feed = RealisticNSEFeed(
+                symbols=symbols, on_tick_callback=self._on_tick,
+                total_duration_seconds=duration_seconds,
+                ticks_per_symbol_per_sec=ticks_per_sym_per_sec,
+                seed=seed,
+            )
 
         # Signal stats (for report)
         self.signal_counts: Dict[str, int] = defaultdict(int)
         self.signals_actionable: int = 0
         self.signals_high_evidence: int = 0
+        # Regime stats
+        self.regime_counts: Dict[str, int] = defaultdict(int)
 
         self.last_sim_ts: float = 0.0
 
@@ -646,14 +825,20 @@ class PaperTradingSession:
             # Executor's price-based checks (SL/TP/max-hold)
             self.executor.on_tick(symbol, snap.ltp, snap.timestamp)
 
-            # Engine update
-            result = self.engines[symbol].update(snap)
+            # Engine update — skip if engine not initialized (live mode edge case)
+            engine = self.engines.get(symbol)
+            if engine is None:
+                return
+            result = engine.update(snap)
             if result is None:
                 return
 
             # Signal stats
             state_val = result.state.value
             self.signal_counts[state_val] += 1
+            # Regime tracking (from Phase 2)
+            self.regime_counts[result.metrics.regime.label] += 1
+
             if state_val in _ACTIONABLE_STATES:
                 self.signals_actionable += 1
                 if result.evidence_strength >= self.executor.entry_min_evidence:
@@ -700,9 +885,36 @@ class PaperTradingSession:
         except Exception:
             return None
 
+    def _initialize_engines(self) -> None:
+        """Create BookDynamicsEngine per symbol AFTER feed prep (needed for live)."""
+        for symbol in self.symbols:
+            if symbol not in self.engines:
+                self.engines[symbol] = BookDynamicsEngine(config=EngineConfig())
+        # Populate token map from feed
+        for symbol, token in self.feed.token_map().items():
+            self.token_to_symbol[token] = symbol
+
     def run(self) -> None:
+        # For live feed, prepare (login + resolve tokens) BEFORE opening executor
+        if self.feed_mode == "live":
+            logger.info("Preparing live Angel One feed…")
+            resolved = self.feed.prepare()
+            # Live symbols come from scanner_config, filter to resolved only
+            self.symbols = list(resolved.keys())
+
+        self._initialize_engines()
+
         self.executor.open()
         real_start = time.perf_counter()
+
+        # SIGINT handler for graceful shutdown during live session
+        def _handler(signum, frame):
+            logger.info("Shutdown signal received; stopping feed…")
+            if hasattr(self.feed, "stop"):
+                self.feed.stop()
+        _signal_mod.signal(_signal_mod.SIGINT, _handler)
+        _signal_mod.signal(_signal_mod.SIGTERM, _handler)
+
         try:
             self.feed.run()
             # End of session: close all remaining positions
@@ -710,9 +922,13 @@ class PaperTradingSession:
         finally:
             self.executor.close_files()
         real_elapsed = time.perf_counter() - real_start
-        logger.info("Session complete in %.1f real seconds "
-                    "(%.1f simulated minutes).",
-                    real_elapsed, self.duration / 60.0)
+        if self.feed_mode == "live":
+            logger.info("Live session complete: %.1f real minutes.",
+                        real_elapsed / 60.0)
+        else:
+            logger.info("Sim session complete in %.1f real seconds "
+                        "(%.1f simulated minutes).",
+                        real_elapsed, self.duration / 60.0)
 
 
 # ============================================================
@@ -815,6 +1031,26 @@ def generate_report(session: PaperTradingSession) -> str:
     lines.append(f"  Avg hold time             : {avg_hold:>8.1f} seconds "
                  f"({avg_hold/60:.1f} min)")
     lines.append(f"  Trade Sharpe (per-trade)  : {sharpe_trade:>8.2f}")
+
+    # -- Regime stats (Phase 2) --
+    if ex.regime_adaptive:
+        lines.append("")
+        lines.append("─" * W)
+        lines.append("  🌀 REGIME STATISTICS (Phase 2)")
+        lines.append("─" * W)
+        lines.append(f"  Signals rejected — RANDOM regime      : {ex.regime_rejected_random:>6,}")
+        lines.append(f"  Signals INVERTED — MEAN_REVERTING     : {ex.regime_inverted_signals:>6,}")
+        lines.append(f"  Signals rejected — HIGH_VOL threshold : {ex.regime_high_vol_reject:>6,}")
+
+        # Top 5 regime combinations observed
+        if session.regime_counts:
+            total = sum(session.regime_counts.values())
+            lines.append("")
+            lines.append(f"  Top regime combinations seen (of {total:,} snapshots):")
+            for regime_label, count in sorted(session.regime_counts.items(),
+                                               key=lambda x: -x[1])[:6]:
+                pct = count / total * 100
+                lines.append(f"    {regime_label:<15} {count:>10,} ({pct:>5.1f}%)")
 
     # -- Exit reason breakdown --
     lines.append("")
@@ -930,37 +1166,60 @@ def _default_symbols() -> List[str]:
 
 def main() -> int:
     p = argparse.ArgumentParser(
-        description="NSE Paper Trading Harness — Realistic Simulation",
+        description="NSE Paper Trading Harness — Simulate OR Live on Real Angel One Feed",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Quick 30-min sim on 20 symbols
+  # Quick 30-min realistic simulation (no broker needed)
   python3 paper_trader.py --duration-min 30
 
-  # Full trading day (6.5 hours) on 100 symbols
-  python3 paper_trader.py --duration-min 390 --symbols 100
+  # With Phase 2 regime-adaptive logic
+  python3 paper_trader.py --duration-min 60 --regime-adaptive
 
-  # Aggressive parameters (weak-signal trading)
-  python3 paper_trader.py --entry-score 3 --entry-evidence 25
+  # LIVE paper trading on real Angel One data (during NSE market hours)
+  python3 paper_trader.py --feed live --config config.json --duration-min 390
 
-  # Conservative — only strong signals
-  python3 paper_trader.py --entry-score 7 --entry-evidence 60
+  # LIVE + regime-adaptive (most realistic real-world test)
+  python3 paper_trader.py --feed live --config config.json --regime-adaptive
+
+  # Aggressive simulation parameters
+  python3 paper_trader.py --entry-score 3 --entry-evidence 25 --regime-adaptive
 """,
     )
+    # Feed selection
+    p.add_argument("--feed", choices=["simulate", "live"], default="simulate",
+                   help="Feed source: 'simulate' (fake ticks) or 'live' "
+                        "(real Angel One WebSocket). Default: simulate.")
+    p.add_argument("--config", default="config.json",
+                   help="Config file for live mode (default: config.json). "
+                        "Ignored for simulate mode.")
+
+    # Session parameters
     p.add_argument("--duration-min", type=float, default=60.0,
-                   help="Simulated market time in minutes (default: 60)")
+                   help="Session duration in minutes. Simulate: sim-time. "
+                        "Live: real wall-clock time. Default: 60.")
     p.add_argument("--symbols", type=int, default=20,
-                   help="Number of symbols to trade (default: 20)")
+                   help="Number of symbols (simulate mode only, ignored for live). "
+                        "Default: 20.")
     p.add_argument("--rate", type=float, default=5.0,
-                   help="Ticks per symbol per second (default: 5)")
+                   help="Ticks per symbol per second (simulate mode only). Default: 5.")
     p.add_argument("--capital", type=float, default=100000.0,
-                   help="Starting capital in ₹ (default: 100,000)")
+                   help="Starting capital in ₹. Default: 100,000.")
+
+    # Entry thresholds
     p.add_argument("--entry-score", type=float, default=5.0,
-                   help="Min |score| to enter (default: 5.0)")
+                   help="Min |smoothed_score| to enter (default: 5.0)")
     p.add_argument("--entry-evidence", type=float, default=40.0,
                    help="Min evidence strength to enter (default: 40)")
+
+    # Phase 2
+    p.add_argument("--regime-adaptive", action="store_true",
+                   help="Enable Phase 2 regime detector: skip RANDOM regime, "
+                        "invert signals in MEAN_REVERTING, adapt thresholds & "
+                        "size by volatility regime.")
+
     p.add_argument("--seed", type=int, default=42,
-                   help="Random seed for reproducibility (default: 42)")
+                   help="Random seed for simulate mode (default: 42)")
     args = p.parse_args()
 
     logging.basicConfig(
@@ -969,25 +1228,47 @@ Examples:
         datefmt="%H:%M:%S",
     )
 
-    # Symbols
-    all_syms = _default_symbols()
-    if args.symbols <= len(all_syms):
-        symbols = all_syms[:args.symbols]
+    scanner_config = None
+    if args.feed == "live":
+        # Load Angel One config
+        try:
+            scanner_config = load_config(args.config)
+        except Exception as e:
+            print(f"\n❌ Config error: {e}\n", file=sys.stderr)
+            print("For live mode, you need config.json with Angel One credentials.",
+                  file=sys.stderr)
+            print("   cp config.example.json config.json  &&  nano config.json\n",
+                  file=sys.stderr)
+            return 2
+        symbols = scanner_config.symbols
+        aggregate_tps_note = "TBD (real feed rate)"
     else:
-        # Extend with generated names
-        symbols = all_syms + [f"SYM{i:03d}-EQ" for i in range(len(all_syms),
-                                                                args.symbols)]
+        # Simulate: build symbol list
+        all_syms = _default_symbols()
+        if args.symbols <= len(all_syms):
+            symbols = all_syms[:args.symbols]
+        else:
+            symbols = all_syms + [f"SYM{i:03d}-EQ"
+                                  for i in range(len(all_syms), args.symbols)]
+        aggregate_tps_note = f"{args.rate * len(symbols):.0f}"
 
     logger.info("═" * 78)
-    logger.info(" 🚀 NSE PAPER TRADING — Realistic Simulation")
+    if args.feed == "live":
+        logger.info(" 🚀 NSE PAPER TRADING — LIVE MODE (Real Angel One Feed)")
+    else:
+        logger.info(" 🚀 NSE PAPER TRADING — SIMULATE MODE (Fake Realistic Feed)")
     logger.info("═" * 78)
-    logger.info(f"  Duration       : {args.duration_min:.0f} sim-minutes")
+    logger.info(f"  Feed mode      : {args.feed}")
+    logger.info(f"  Duration       : {args.duration_min:.0f} minutes")
     logger.info(f"  Symbols        : {len(symbols)}")
-    logger.info(f"  Tick rate      : {args.rate:.1f} tps/symbol "
-                f"(aggregate {args.rate * len(symbols):.0f} tps)")
+    if args.feed == "simulate":
+        logger.info(f"  Tick rate      : {args.rate:.1f} tps/symbol "
+                    f"(aggregate {aggregate_tps_note} tps)")
     logger.info(f"  Starting capital: ₹ {args.capital:,.0f}")
     logger.info(f"  Entry threshold: |score|≥{args.entry_score:.1f}, "
                 f"evidence≥{args.entry_evidence:.0f}")
+    logger.info(f"  Regime-adaptive: {'ON' if args.regime_adaptive else 'OFF'} "
+                f"(Phase 2)")
     logger.info("═" * 78)
 
     session = PaperTradingSession(
@@ -998,6 +1279,9 @@ Examples:
         entry_score_threshold=args.entry_score,
         entry_min_evidence=args.entry_evidence,
         seed=args.seed,
+        feed_mode=args.feed,
+        scanner_config=scanner_config,
+        regime_adaptive=args.regime_adaptive,
     )
 
     real_start = time.perf_counter()
@@ -1008,8 +1292,11 @@ Examples:
     print()
     print(report)
     print()
-    logger.info(f"Real wall-clock time: {real_elapsed:.1f}s "
-                f"(sim speedup: {args.duration_min*60.0/real_elapsed:.0f}x)")
+    if args.feed == "simulate":
+        logger.info(f"Real wall-clock time: {real_elapsed:.1f}s "
+                    f"(sim speedup: {args.duration_min*60.0/real_elapsed:.0f}x)")
+    else:
+        logger.info(f"Live session wall-clock: {real_elapsed/60.0:.1f} minutes")
 
     return 0
 

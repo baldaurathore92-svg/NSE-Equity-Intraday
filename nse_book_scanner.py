@@ -163,6 +163,176 @@ class MarketSnapshot:
 
 
 @dataclass
+class RegimeState:
+    """
+    Phase 2 — Market regime classification per symbol.
+
+    Regime dimensions:
+      - Volatility:   LOW / NORMAL / HIGH  (recent σ vs baseline σ)
+      - Trend:        TRENDING_UP / TRENDING_DOWN / MEAN_REVERTING / RANDOM
+                      (based on lag-1 autocorrelation + mean of recent returns)
+      - Depth Bias:   BULL_STRUCTURAL / BEAR_STRUCTURAL / BALANCED
+                      (based on rolling book-wide imbalance)
+
+    Trading interpretation:
+      - TRENDING regime  → scanner's directional signals are meaningful
+      - MEAN_REVERTING   → INVERT signals (contrarian mode)
+      - RANDOM           → no edge, DO NOT trade
+      - HIGH_VOL         → widen thresholds, smaller position size
+      - LOW_VOL          → tighten thresholds, take more marginal signals
+    """
+    volatility: str = "NORMAL"        # LOW / NORMAL / HIGH
+    trend: str = "RANDOM"             # TRENDING_UP / TRENDING_DOWN / MEAN_REVERTING / RANDOM
+    depth_bias: str = "BALANCED"      # BULL_STRUCTURAL / BEAR_STRUCTURAL / BALANCED
+    volatility_ratio: float = 1.0     # recent_σ / baseline_σ
+    autocorr_lag1: float = 0.0        # lag-1 autocorrelation of tick returns
+    depth_imbalance_mean: float = 0.0 # rolling mean of book_wide_imbalance
+    is_confident: bool = False        # True once warm-up (~500 baseline samples) complete
+
+    @property
+    def label(self) -> str:
+        """Compact human-readable regime label."""
+        v = self.volatility[0]  # L/N/H
+        t = {"TRENDING_UP": "T↑", "TRENDING_DOWN": "T↓",
+             "MEAN_REVERTING": "MR", "RANDOM": "R"}.get(self.trend, "?")
+        d = {"BULL_STRUCTURAL": "B", "BEAR_STRUCTURAL": "S",
+             "BALANCED": "N"}.get(self.depth_bias, "?")
+        return f"{v}·{t}·{d}"
+
+    def is_tradeable(self) -> bool:
+        """Should scanner trade in this regime? False = no edge."""
+        if not self.is_confident:
+            return False   # not enough data yet
+        if self.trend == "RANDOM":
+            return False   # no directional edge
+        return True
+
+    def should_invert_signal(self) -> bool:
+        """In mean-reverting regime, invert LONG↔SHORT (contrarian)."""
+        return self.is_confident and self.trend == "MEAN_REVERTING"
+
+
+class RegimeDetector:
+    """
+    Per-symbol regime classifier. Lightweight — designed to run alongside
+    BookDynamicsEngine for 100+ symbols simultaneously.
+
+    Performance:
+      - Recompute only every N ticks (default 100), not per-tick
+      - Uses same pattern as our other rolling buffers (deque-based)
+      - Total memory per symbol: ~5000 floats = ~40KB
+    """
+
+    def __init__(
+        self,
+        update_every_n_ticks: int = 100,
+        recent_window: int = 500,
+        baseline_window: int = 5000,
+        vol_high_threshold: float = 1.5,
+        vol_low_threshold: float = 0.7,
+        autocorr_trending_threshold: float = 0.10,
+        autocorr_reverting_threshold: float = -0.08,
+        depth_bias_threshold: float = 0.15,
+    ):
+        self.update_every = update_every_n_ticks
+        self.vol_high = vol_high_threshold
+        self.vol_low = vol_low_threshold
+        self.trend_up = autocorr_trending_threshold
+        self.trend_down = autocorr_reverting_threshold
+        self.depth_bias_thr = depth_bias_threshold
+
+        self.recent_returns:    Deque[float] = deque(maxlen=recent_window)
+        self.baseline_returns:  Deque[float] = deque(maxlen=baseline_window)
+        self.recent_imbalances: Deque[float] = deque(maxlen=recent_window)
+
+        self.last_price:  Optional[float] = None
+        self.tick_count:  int = 0
+        self.ticks_since_update: int = 0
+        self.current_regime = RegimeState()
+
+    def update(self, ltp: float, book_wide_imbalance: float) -> RegimeState:
+        """Called by engine on every tick. Cheap; heavy compute batched."""
+        if self.last_price is not None and self.last_price > 0:
+            ret = (ltp - self.last_price) / self.last_price
+            self.recent_returns.append(ret)
+            self.baseline_returns.append(ret)
+        self.last_price = ltp
+        self.recent_imbalances.append(book_wide_imbalance)
+
+        self.tick_count += 1
+        self.ticks_since_update += 1
+        if self.ticks_since_update >= self.update_every:
+            self.ticks_since_update = 0
+            self._recompute()
+        return self.current_regime
+
+    def _recompute(self) -> None:
+        if len(self.recent_returns) < 50:
+            return
+
+        # ---- Volatility regime ----
+        recent_std = self._std(self.recent_returns)
+        baseline_std = (self._std(self.baseline_returns)
+                        if len(self.baseline_returns) >= 500 else recent_std)
+        vol_ratio = recent_std / max(baseline_std, 1e-9)
+        if vol_ratio > self.vol_high:
+            vol_regime = "HIGH"
+        elif vol_ratio < self.vol_low:
+            vol_regime = "LOW"
+        else:
+            vol_regime = "NORMAL"
+
+        # ---- Trend regime (via lag-1 autocorrelation of returns) ----
+        autocorr = self._autocorr_lag1(self.recent_returns)
+        mean_return = sum(self.recent_returns) / len(self.recent_returns)
+        if autocorr > self.trend_up:
+            trend_regime = "TRENDING_UP" if mean_return > 0 else "TRENDING_DOWN"
+        elif autocorr < self.trend_down:
+            trend_regime = "MEAN_REVERTING"
+        else:
+            trend_regime = "RANDOM"
+
+        # ---- Depth bias ----
+        depth_mean = sum(self.recent_imbalances) / len(self.recent_imbalances)
+        if depth_mean > self.depth_bias_thr:
+            depth_regime = "BULL_STRUCTURAL"
+        elif depth_mean < -self.depth_bias_thr:
+            depth_regime = "BEAR_STRUCTURAL"
+        else:
+            depth_regime = "BALANCED"
+
+        self.current_regime = RegimeState(
+            volatility=vol_regime, trend=trend_regime, depth_bias=depth_regime,
+            volatility_ratio=vol_ratio, autocorr_lag1=autocorr,
+            depth_imbalance_mean=depth_mean,
+            is_confident=(len(self.baseline_returns) >= 500),
+        )
+
+    @staticmethod
+    def _std(values) -> float:
+        n = len(values)
+        if n < 2:
+            return 0.0
+        mean = sum(values) / n
+        var = sum((x - mean) ** 2 for x in values) / n
+        return var ** 0.5
+
+    @staticmethod
+    def _autocorr_lag1(values) -> float:
+        """Pearson lag-1 autocorrelation. Range [-1, +1]."""
+        vals = list(values)
+        n = len(vals)
+        if n < 3:
+            return 0.0
+        mean = sum(vals) / n
+        den = sum((x - mean) ** 2 for x in vals)
+        if den < 1e-18:
+            return 0.0
+        num = sum((vals[i] - mean) * (vals[i-1] - mean) for i in range(1, n))
+        return num / den
+
+
+@dataclass
 class BookMetrics:
     """All computed microstructure metrics for one snapshot."""
     timestamp: float
@@ -212,6 +382,9 @@ class BookMetrics:
     spoofing_suspicion:        float = 0.0
     iceberg_suspicion:         float = 0.0
     replenishment_score:       float = 0.0
+
+    # ---- Phase 2 — Market Regime ----
+    regime: RegimeState = field(default_factory=RegimeState)
 
     # ---- Kill switch ----
     kill_switch_active: bool = False
@@ -437,6 +610,9 @@ class BookDynamicsEngine:
         # Max tracked levels (LRU-style cap)
         self._MAX_TRACKED_LEVELS: int = 500
 
+        # Phase 2 — Per-symbol regime detector
+        self._regime_detector = RegimeDetector()
+
         # Spoof: recent pull events awaiting execution confirmation
         self._pull_events: Deque[Dict[str, Any]] = deque(maxlen=500)
 
@@ -657,6 +833,9 @@ class BookDynamicsEngine:
         if snap.lower_circuit and snap.ltp <= 1.001 * snap.lower_circuit:
             m.kill_switch_active = True
             m.kill_switch_reason = "Lower circuit hit"
+
+        # ---- Phase 2 — Regime detection (per-tick update, batched recompute) ----
+        m.regime = self._regime_detector.update(snap.ltp, m.book_wide_imbalance)
 
         return m
 
@@ -1112,6 +1291,15 @@ class BookDynamicsEngine:
             "Replenishment":          round(m.replenishment_score, 3),
             "KillSwitch":             m.kill_switch_active,
             "KillReason":             m.kill_switch_reason,
+            # Phase 2 regime
+            "Regime":                 m.regime.label,
+            "Regime_Volatility":      m.regime.volatility,
+            "Regime_Trend":           m.regime.trend,
+            "Regime_DepthBias":       m.regime.depth_bias,
+            "Regime_VolRatio":        round(m.regime.volatility_ratio, 3),
+            "Regime_Autocorr":        round(m.regime.autocorr_lag1, 3),
+            "Regime_Tradeable":       m.regime.is_tradeable(),
+            "Regime_Confident":       m.regime.is_confident,
         }
 
 
