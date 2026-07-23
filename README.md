@@ -267,6 +267,145 @@ regime-adaptive value.
 
 ---
 
+## 📼 Record→Replay Workflow (Real Tick Backtesting)
+
+**यह सबसे important workflow है for honest strategy validation.**
+
+Random-walk simulators can never replicate real NSE microstructure —
+actual spoofing, iceberg orders, institutional flow, news reactions,
+cross-symbol correlation. So the ONLY way to know if the scanner has
+real alpha is to **record live NSE data and backtest on it**.
+
+### Two-Tool Pipeline
+
+```
+   ┌──────────────────────────┐         ┌──────────────────────────┐
+   │  tick_recorder.py         │         │  historical_backtest.py  │
+   │  (Days 1-5, live market)  │────────►│  (Day 6+, offline)       │
+   │                           │  data/  │                          │
+   │  Angel One WebSocket      │ *.jsonl │  Read recorded ticks     │
+   │  → gzip JSONL (hourly)    │  .gz    │  → BookDynamicsEngine    │
+   │  ~500 MB/day compressed   │         │  → PaperExecutor         │
+   │                           │         │  → EOD comprehensive     │
+   │                           │         │     report               │
+   └──────────────────────────┘         └──────────────────────────┘
+```
+
+### Step 1: Record Real NSE Ticks (5 trading days)
+
+```bash
+# On your VPS, during market hours:
+tmux new -s recorder
+cd NSE-Equity-Intraday
+python3 tick_recorder.py --config config.json --output-dir data/
+# Auto-stops at 15:30 IST. Ctrl+B, D to detach.
+```
+
+**Output:**
+```
+data/
+├── 2026-07-22/
+│   ├── ticks_2026-07-22_09.jsonl.gz    ← 45 MB (opening)
+│   ├── ticks_2026-07-22_10.jsonl.gz    ← 38 MB
+│   ├── ...
+│   └── ticks_2026-07-22_15.jsonl.gz    ← 42 MB (closing burst)
+├── 2026-07-23/
+...
+```
+
+Total for 5 days × 100 symbols: **~2-3 GB compressed**.
+
+### Step 2: Backtest on Recorded Real Data
+
+```bash
+# Default parameters
+python3 historical_backtest.py --data-dir data/
+
+# With Phase 2 regime adaptive
+python3 historical_backtest.py --data-dir data/ --regime-adaptive
+
+# Specific symbols
+python3 historical_backtest.py --data-dir data/ --symbols RELIANCE-EQ,TCS-EQ
+
+# Specific date range
+python3 historical_backtest.py --data-dir data/ \
+    --from-date 2026-07-22 --to-date 2026-07-26
+
+# Tune parameters (multiple runs on SAME data — this is the value!)
+python3 historical_backtest.py --data-dir data/ --entry-score 3   # aggressive
+python3 historical_backtest.py --data-dir data/ --entry-score 5   # default
+python3 historical_backtest.py --data-dir data/ --entry-score 7   # conservative
+```
+
+You'll get the same comprehensive report as paper_trader.py, but the numbers
+are **based on real market data** — real hit rate, real edge or lack thereof.
+
+### Step 3: systemd Service (Optional but Recommended)
+
+For 24/7 recording without manual tmux management, install as systemd service:
+
+```bash
+# Create service file:
+sudo tee /etc/systemd/system/nse-tick-recorder.service <<EOF
+[Unit]
+Description=NSE Tick Recorder (Angel One SnapQuote Capture)
+After=network-online.target
+
+[Service]
+Type=simple
+User=${USER}
+WorkingDirectory=/home/${USER}/NSE-Equity-Intraday
+Environment=PATH=/home/${USER}/NSE-Equity-Intraday/venv/bin:/usr/bin
+ExecStart=/home/${USER}/NSE-Equity-Intraday/venv/bin/python3 \\
+    /home/${USER}/NSE-Equity-Intraday/tick_recorder.py \\
+    --config /home/${USER}/NSE-Equity-Intraday/config.json \\
+    --output-dir /home/${USER}/nse_data
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Enable + start:
+sudo systemctl daemon-reload
+sudo systemctl enable nse-tick-recorder
+sudo systemctl start nse-tick-recorder
+
+# Monitor:
+journalctl -u nse-tick-recorder -f
+```
+
+Recorder will now start automatically on VPS boot and restart on any crash.
+Auto-stops at 15:30 IST daily; will restart next morning if VPS is on.
+
+### Why This Approach is Right
+
+| | Random Simulator | **Real Recorded Ticks** |
+|---|---|---|
+| Order flow intent | Fake (RNG) | **Real (institutional + retail)** |
+| Spoofing patterns | None | **Actual operator behavior** |
+| Iceberg orders | Fake | **Real hidden liquidity** |
+| News reactions | None | **Real fat-tail moves** |
+| Time-of-day effects | Approximated | **Genuine microstructure** |
+| Cross-symbol correlation | Zero | **Real Nifty gravity** |
+| **Backtest validity** | **Illusion** | **Ground truth** |
+
+### 🔄 The Real Iteration Loop
+
+```
+1. Record 5 days of real data (once)
+2. Try 20 different parameter combos in 1 hour  ← THIS is the payoff
+3. Compare results side-by-side
+4. Best config → paper trade with --feed live for 5 more days
+5. If STILL profitable → very small real capital (₹10K max)
+6. Scale slowly only after multi-week validation
+```
+
+---
+
 ## 🎯 How to Test on Real Data (Live Paper Trading)
 
 The realistic simulator is our best offline approximation of NSE, but only

@@ -26,6 +26,7 @@ warn()  { echo -e "${YELLOW}  ⚠ $1${NC}"; }
 error() { echo -e "${RED}  ✗ $1${NC}"; }
 
 INSTALL_DIR="$HOME/nse_scanner"
+DATA_DIR="$HOME/nse_data"          # for recorded tick data (record→replay workflow)
 PYTHON_MIN="3.9"
 
 echo -e "${BLUE}"
@@ -104,8 +105,10 @@ fi
 # ----------------------------------------------------------------
 # 6. Create Python virtual environment + install packages
 # ----------------------------------------------------------------
-step "6/8  Python virtual environment"
+step "6/8  Python virtual environment + data directory"
 mkdir -p "$INSTALL_DIR"
+mkdir -p "$DATA_DIR"   # for recorded live NSE ticks (record→replay workflow)
+ok "Data directory ready: $DATA_DIR"
 cd "$INSTALL_DIR"
 
 if [ ! -d "venv" ]; then
@@ -177,22 +180,40 @@ cat <<EOF
   1. Credentials भरें:
        nano ~/nse_scanner/config.json
 
-  2. Simulate mode में पहले test करें (कोई credential नहीं चाहिए):
-       cd ~/nse_scanner
-       source venv/bin/activate
-       python3 nse_book_scanner.py --mode simulate
-
-  3. जब simulate ठीक चले, तो live mode में जाएँ:
-       python3 nse_book_scanner.py --mode live
-
-  4. VPS पर persistent चलाने के लिए tmux use करें:
-       tmux new -s scanner
+  2. Live scanner test (कोई credentials नहीं चाहिए — sim mode):
        cd ~/nse_scanner && source venv/bin/activate
-       python3 nse_book_scanner.py --mode live
-       (detach: Ctrl+B फिर D)
-       (reattach later: tmux attach -t scanner)
+       python3 nse_book_scanner.py --demo               # engine self-test
+       python3 nse_book_scanner.py --mode simulate      # 100-symbol sim
 
-  5. Auto-restart वाला production setup:
-       ./install_service.sh   (systemd unit — VPS reboot पर भी चलेगा)
+  ───────────────────────────────────────────────────────────────────
+  📼 RECOMMENDED WORKFLOW: Record→Replay Backtesting
+  ───────────────────────────────────────────────────────────────────
+
+  3. Record LIVE NSE ticks for 5 trading days (during market hours 9:15-15:30):
+       cd ~/nse_scanner && source venv/bin/activate
+       python3 tick_recorder.py --config config.json --output-dir ~/nse_data
+
+     Or install as auto-restart systemd service:
+       ./install_recorder_service.sh
+       sudo systemctl start nse-tick-recorder
+       journalctl -u nse-tick-recorder -f     # monitor live
+
+  4. Backtest on real recorded data (offline, any time):
+       python3 historical_backtest.py --data-dir ~/nse_data
+       python3 historical_backtest.py --data-dir ~/nse_data --regime-adaptive
+       python3 historical_backtest.py --data-dir ~/nse_data --entry-score 7
+
+  ───────────────────────────────────────────────────────────────────
+  Alternate: Live paper trading (no recording, direct virtual trades):
+       python3 paper_trader.py --feed live --config config.json --regime-adaptive
+
+  Alternate: Real trading (⚠ real money — do NOT deploy without weeks of backtest):
+       python3 nse_book_scanner.py --mode live
+       ./install_service.sh    # for auto-restart production setup
+
+  Data locations:
+       ~/nse_scanner/           — Code + config
+       ~/nse_data/              — Recorded ticks (~500 MB/day, 2-3 GB for 5 days)
+       ~/nse_scanner/logs/      — Signals + trades JSONL
 
 EOF
