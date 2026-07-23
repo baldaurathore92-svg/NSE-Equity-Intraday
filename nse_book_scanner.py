@@ -677,8 +677,11 @@ class BookDynamicsEngine:
 
     def _validate(self, snap: MarketSnapshot) -> bool:
         if snap.timestamp <= self._last_ts:
-            logger.warning(
-                "Out-of-order or duplicate snapshot ts=%.6f (last=%.6f); dropping",
+            # Angel One sends same-timestamp snapshots multiple times per second
+            # (WebSocket redundancy). Dedup is working correctly — this is normal
+            # market behavior. DEBUG level to keep terminal clean.
+            logger.debug(
+                "Duplicate snapshot ts=%.6f (last=%.6f); dropping",
                 snap.timestamp, self._last_ts,
             )
             return False
