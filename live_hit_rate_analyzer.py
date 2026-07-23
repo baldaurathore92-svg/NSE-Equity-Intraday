@@ -1215,6 +1215,8 @@ class LiveHitRateSession:
         diagnose: bool = False,
         dump_count: int = 100,
         dump_path: str = "logs/raw_ws_dump.jsonl",
+        # Custom EngineConfig — allows CLI to override thresholds, EMA, etc.
+        engine_config: Optional[EngineConfig] = None,
     ):
         if not SMARTAPI_AVAILABLE:
             raise ImportError(
@@ -1223,6 +1225,7 @@ class LiveHitRateSession:
             )
         self.config = config
         self.analyzer = analyzer
+        self.engine_config: EngineConfig = engine_config or EngineConfig()
         self.connector = AngelOneConnector(config)
         self.engines: Dict[str, BookDynamicsEngine] = {}
         self.token_to_symbol: Dict[int, str] = {}
@@ -1336,7 +1339,7 @@ class LiveHitRateSession:
             # STEP 2: Engine update to get new signal
             engine = self.engines.get(symbol)
             if engine is None:
-                engine = BookDynamicsEngine(config=EngineConfig())
+                engine = BookDynamicsEngine(config=self.engine_config)
                 self.engines[symbol] = engine
             result = engine.update(snap)
             if result is None:
@@ -2175,6 +2178,27 @@ Examples:
                         "Same state fires within this window are ignored to "
                         "prevent memory/disk blowup during sustained signals.")
 
+    # -- Score threshold overrides (calibrated to real market data) --
+    # Defaults: strong=4.0, normal=3.0, weak=2.0 (from empirical 67k
+    # signals; smoothed_score rarely exceeds ±5 due to EMA + weighted-avg
+    # dampening). Old defaults (strong=8) were unreachable.
+    p.add_argument("--strong-threshold", type=float, default=None,
+                   help="Score threshold for STRONG_LONG / STRONG_SHORT state "
+                        "(default: 4.0). Signals with |score| ≥ this fire as "
+                        "STRONG state. Old default 8.0 was unreachable — "
+                        "calibrated to real live NSE data.")
+    p.add_argument("--normal-threshold", type=float, default=None,
+                   help="Score threshold for LONG / SHORT state "
+                        "(default: 3.0)")
+    p.add_argument("--weak-threshold", type=float, default=None,
+                   help="Score threshold for WEAK_LONG / WEAK_SHORT state "
+                        "(default: 2.0). Below this = NEUTRAL (no signal).")
+    p.add_argument("--ema-alpha", type=float, default=None,
+                   help="EMA smoothing factor for score (default: 0.3). "
+                        "Higher = faster response to raw score changes "
+                        "(0.6 = tighter tracking, but more noise). "
+                        "Lower = smoother but delayed (0.15 = very stable).")
+
     # -- Signal quality gates (OPTIONAL — all default to disabled) --
     p.add_argument("--session-filter", action="store_true",
                    help="Enable NSE session phase filter. Signals fired "
@@ -2359,12 +2383,35 @@ def main() -> int:
     # to keep signature small; setting attribute directly is cheap)
     analyzer.strict_rvol_warmup = args.rvol_strict_warmup
 
+    # Build custom EngineConfig if user overrode thresholds
+    engine_config = EngineConfig()
+    threshold_overrides = []
+    if args.strong_threshold is not None:
+        engine_config.threshold_strong = args.strong_threshold
+        threshold_overrides.append(f"strong={args.strong_threshold}")
+    if args.normal_threshold is not None:
+        engine_config.threshold_normal = args.normal_threshold
+        threshold_overrides.append(f"normal={args.normal_threshold}")
+    if args.weak_threshold is not None:
+        engine_config.threshold_weak = args.weak_threshold
+        threshold_overrides.append(f"weak={args.weak_threshold}")
+    if args.ema_alpha is not None:
+        engine_config.ema_alpha = args.ema_alpha
+        threshold_overrides.append(f"ema_alpha={args.ema_alpha}")
+
+    logger.info(f"  Score thresholds: STRONG≥{engine_config.threshold_strong}, "
+                f"NORMAL≥{engine_config.threshold_normal}, "
+                f"WEAK≥{engine_config.threshold_weak}, "
+                f"EMA_alpha={engine_config.ema_alpha}"
+                f"{' (overridden: ' + ', '.join(threshold_overrides) + ')' if threshold_overrides else ' (defaults)'}")
+
     # Build session (with optional diagnostic dump)
     session = LiveHitRateSession(
         config=config, analyzer=analyzer,
         diagnose=args.diagnose,
         dump_count=args.dump_count,
         dump_path=args.dump_path,
+        engine_config=engine_config,
     )
 
     # -- STARTUP PROGRESS INDICATORS (each stage clearly logged) --

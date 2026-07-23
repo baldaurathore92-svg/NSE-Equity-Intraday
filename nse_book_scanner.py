@@ -560,8 +560,19 @@ class EngineConfig:
     ema_alpha: float = 0.3
 
     # State thresholds on smoothed score in [-10, +10]
-    threshold_strong: float = 8.0
-    threshold_normal: float = 5.0
+    # ⚠ Empirical calibration (based on 67k signals from live NSE data):
+    #    Max abs(smoothed_score) achievable in normal market ≈ 5.0
+    #    Even during calm periods, weighted-avg of 8 features + EMA-α=0.3
+    #    smoothing means score rarely exceeds ±5.
+    #
+    # Old defaults (STRONG=8, NORMAL=5) had STRONG_LONG effectively
+    # unreachable — 0/67632 signals crossed 6.0 in a 6-min live run.
+    # New defaults are calibrated to observed distribution:
+    #    ≥ 2.0: 100% of signals (WEAK)
+    #    ≥ 3.0: 16% of signals    (NORMAL — LONG/SHORT)
+    #    ≥ 4.0: 1%  of signals    (STRONG — STRONG_LONG/STRONG_SHORT)
+    threshold_strong: float = 4.0
+    threshold_normal: float = 3.0
     threshold_weak:   float = 2.0
 
 
