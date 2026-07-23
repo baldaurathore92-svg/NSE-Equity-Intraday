@@ -38,6 +38,7 @@ info()  { echo -e "${CYAN}  → $1${NC}"; }
 # ============================================================
 MODE="diagnostic"
 DURATION="0.25"
+EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -49,13 +50,24 @@ while [[ $# -gt 0 ]]; do
 SETUP.sh - One file, one command, everything works.
 
 Usage:
-  bash SETUP.sh              Setup + 15-minute diagnostic run (default)
-  bash SETUP.sh --full       Setup + 6.5-hour full trading day
-  bash SETUP.sh --duration N Setup + N-hour custom run
-  bash SETUP.sh --setup-only Setup only (don't launch analyzer)
-  bash SETUP.sh --help       Show this
+  bash SETUP.sh                    Setup + 15-minute diagnostic (default)
+  bash SETUP.sh --full             Setup + 6.5-hour full trading day
+  bash SETUP.sh --duration N       Setup + N-hour custom run
+  bash SETUP.sh --setup-only       Setup only (don't launch analyzer)
+  bash SETUP.sh -- <args>          Pass extra args to analyzer
+  bash SETUP.sh --help             Show this
+
+Examples with pass-through:
+  bash SETUP.sh --full -- --strong-threshold 3.5
+  bash SETUP.sh --full -- --min-rvol 1.5 --session-filter
+  bash SETUP.sh -- --strong-threshold 5.0 --ema-alpha 0.5
 HELP
             exit 0 ;;
+        --)
+            # Everything after '--' passes through to python analyzer
+            shift
+            EXTRA_ARGS=("$@")
+            break ;;
         *) err "Unknown flag: $1 (use --help)"; exit 2 ;;
     esac
 done
@@ -382,6 +394,10 @@ echo ""
 CMD=(python3 live_hit_rate_analyzer.py --config "$CONFIG" --duration-hours "$DURATION")
 if [ "$MODE" = "diagnostic" ]; then
     CMD+=(--diagnose)
+fi
+# Append any pass-through args (after '--' in CLI)
+if [ ${#EXTRA_ARGS[@]} -gt 0 ]; then
+    CMD+=("${EXTRA_ARGS[@]}")
 fi
 
 info "Running: ${CMD[*]}"
