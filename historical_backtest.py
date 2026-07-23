@@ -208,8 +208,9 @@ class HistoricalBacktester:
         self,
         reader: RecordedTickReader,
         capital: float = 100_000.0,
-        entry_score_threshold: float = 5.0,
-        entry_min_evidence: float = 40.0,
+        # Calibrated to new engine STRONG threshold (4.0)
+        entry_score_threshold: float = 4.0,
+        entry_min_evidence: float = 30.0,
         regime_adaptive: bool = False,
         trades_log_path: str = "logs/backtest_trades.jsonl",
         equity_log_path: str = "logs/backtest_equity.csv",
@@ -437,10 +438,11 @@ Compare configurations:
     # Executor params (same as paper_trader.py)
     p.add_argument("--capital", type=float, default=100000.0,
                    help="Starting capital ₹ (default: 100,000)")
-    p.add_argument("--entry-score", type=float, default=5.0,
-                   help="Min |smoothed_score| to enter (default: 5.0)")
-    p.add_argument("--entry-evidence", type=float, default=40.0,
-                   help="Min evidence strength to enter (default: 40)")
+    p.add_argument("--entry-score", type=float, default=4.0,
+                   help="Min |smoothed_score| to enter (default: 4.0 = "
+                        "engine STRONG threshold)")
+    p.add_argument("--entry-evidence", type=float, default=30.0,
+                   help="Min evidence strength to enter (default: 30)")
     p.add_argument("--regime-adaptive", action="store_true",
                    help="Enable Phase 2 regime-adaptive signal filtering")
 

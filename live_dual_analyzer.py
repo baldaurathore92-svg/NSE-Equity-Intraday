@@ -150,8 +150,9 @@ class DualAnalyzerSession:
         signal_dedup_seconds: float = 5.0,
         # -- PaperExecutor params --
         capital: float = 100_000.0,
-        entry_score_threshold: float = 5.0,
-        entry_min_evidence: float = 40.0,
+        # Calibrated to new engine STRONG threshold (4.0)
+        entry_score_threshold: float = 4.0,
+        entry_min_evidence: float = 30.0,
         risk_per_trade_pct: float = 0.01,
         stop_loss_pct: float = 0.0030,
         take_profit_pct: float = 0.0080,
@@ -1096,8 +1097,10 @@ Examples:
 
     # PaperExecutor params
     p.add_argument("--capital", type=float, default=100000.0)
-    p.add_argument("--entry-score", type=float, default=5.0)
-    p.add_argument("--entry-evidence", type=float, default=40.0)
+    p.add_argument("--entry-score", type=float, default=4.0,
+                   help="Min |smoothed_score| to enter (default 4.0)")
+    p.add_argument("--entry-evidence", type=float, default=30.0,
+                   help="Min evidence strength (default 30)")
     p.add_argument("--stop-loss-pct", type=float, default=0.0030)
     p.add_argument("--take-profit-pct", type=float, default=0.0080)
     p.add_argument("--max-hold-sec", type=float, default=300.0)

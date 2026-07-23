@@ -574,8 +574,13 @@ class PaperExecutor:
         capital: float = 100_000.0,
         risk_per_trade_pct: float = 0.01,
         max_concurrent_positions: int = 5,
-        entry_score_threshold: float = 5.0,
-        entry_min_evidence: float = 40.0,
+        # ⚠ Calibrated to new engine thresholds (STRONG=4.0):
+        #    - Score 4.0 is STRONG_LONG boundary → paper trader takes STRONG signals
+        #    - Evidence 30 = achievable at score 3.0 with 100% agreement
+        #    - Previously (5.0 / 40.0) required score ≥ 4 with 100% agreement,
+        #      effectively unreachable given old engine threshold_strong=8.0
+        entry_score_threshold: float = 4.0,
+        entry_min_evidence: float = 30.0,
         slippage_bps: float = 10.0,          # 0.10% slippage
         cost_pct_round_trip: float = 0.0006,  # 0.06%
         stop_loss_pct: float = 0.0030,        # 0.30%
@@ -955,8 +960,9 @@ class PaperTradingSession:
         self, symbols: List[str], duration_seconds: float,
         ticks_per_sym_per_sec: float = 5.0,
         capital: float = 100_000.0,
-        entry_score_threshold: float = 5.0,
-        entry_min_evidence: float = 40.0,
+        # Calibrated to engine STRONG threshold 4.0 (see PaperExecutor comment)
+        entry_score_threshold: float = 4.0,
+        entry_min_evidence: float = 30.0,
         seed: int = 42,
         # ---- Feed selection ----
         feed_mode: str = "simulate",              # "simulate" | "live"
@@ -1454,10 +1460,14 @@ Examples:
                    help="Starting capital in ₹. Default: 100,000.")
 
     # Entry thresholds
-    p.add_argument("--entry-score", type=float, default=5.0,
-                   help="Min |smoothed_score| to enter (default: 5.0)")
-    p.add_argument("--entry-evidence", type=float, default=40.0,
-                   help="Min evidence strength to enter (default: 40)")
+    p.add_argument("--entry-score", type=float, default=4.0,
+                   help="Min |smoothed_score| to enter (default: 4.0 = "
+                        "engine STRONG threshold; use 3.0 for more entries, "
+                        "5.0+ for stricter)")
+    p.add_argument("--entry-evidence", type=float, default=30.0,
+                   help="Min evidence strength to enter (default: 30 = "
+                        "achievable at score 3.0 with 100%% agreement; "
+                        "raise to 40+ for stricter, lower to 20 for more)")
 
     # Phase 2
     p.add_argument("--regime-adaptive", action="store_true",
