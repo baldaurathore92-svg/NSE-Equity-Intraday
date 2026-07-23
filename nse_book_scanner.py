@@ -54,12 +54,14 @@ import bisect
 import logging
 import math
 import queue as _queue_mod
+import statistics
 import threading
 import time
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from datetime import datetime, time as dt_time, timedelta, timezone
 from enum import Enum
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
 # ---------------------------------------------------------------------------
 # 1. Constants, logger, enums
@@ -2064,6 +2066,449 @@ class PredictionTracker:
                     f"hit_rate={hits/total*100:.1f}% "
                     f"net_hit_rate={net_hits/total*100:.1f}% "
                     f"avg_net={net_return*100:+.3f}%")
+
+
+# ---------------------------------------------------------------------------
+# 4b. Signal Quality Gates (optional, non-invasive)
+#
+# ये दो utility classes signals को filter करने में मदद करती हैं।
+# दोनों STANDALONE हैं — signal generation में कुछ नहीं बदलता। सिर्फ
+# analyzers/executors इन्हें call करके decide करते हैं कि signal को
+# accept करना है या block।
+#
+#   SessionStateManager  →  NSE market phase tracker (IST-fixed)
+#                           avoid lunch/closing/pre-open signals
+#
+#   RVOLCalculator       →  Relative volume vs rolling 20-min avg
+#                           trust signals only when volume elevated
+#
+# दोनों अगर None हैं तो कोई filter नहीं होगा (backward-compat)।
+# ---------------------------------------------------------------------------
+
+
+class SessionPhase(Enum):
+    """
+    NSE Equity segment के trading day की अलग-अलग phases।
+
+    तीन 'सामान्य trading' phases (OPENING, MORNING, AFTERNOON) में signals
+    सबसे reliable होते हैं। LUNCH में liquidity कम, PRE_CLOSE/CLOSING में
+    लोग squaring off कर रहे होते हैं (fundamentals से हट कर) — इसलिए
+    इन्हें default में allowed set से बाहर रखते हैं।
+    """
+    PRE_OPEN_ENTRY = "PRE_OPEN_ENTRY"     # 09:00 – 09:07:59 (order collection)
+    PRE_OPEN_MATCH = "PRE_OPEN_MATCH"     # 09:08 – 09:14:59 (no book changes)
+    OPENING        = "OPENING"            # 09:15 – 09:30    (opening volatility)
+    MORNING        = "MORNING"            # 09:30 – 11:30    (best trending phase)
+    LUNCH          = "LUNCH"              # 11:30 – 13:30    (low activity)
+    AFTERNOON      = "AFTERNOON"          # 13:30 – 15:00    (positioning)
+    PRE_CLOSE      = "PRE_CLOSE"          # 15:00 – 15:20    (squaring begins)
+    CLOSING        = "CLOSING"            # 15:20 – 15:30    (heavy squaring)
+    POST_CLOSE     = "POST_CLOSE"         # 15:30 – 16:00    (closing session)
+    CLOSED         = "CLOSED"             # outside all above
+    WEEKEND        = "WEEKEND"            # Saturday / Sunday
+    HOLIDAY        = "HOLIDAY"            # user-configured trading holiday
+
+
+# NSE IST timezone (fixed, doesn't depend on system TZ setting)
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+# Default set of phases where signals are considered "tradeable"
+# (User can override via CLI / config)
+DEFAULT_TRADEABLE_PHASES: FrozenSet[SessionPhase] = frozenset({
+    SessionPhase.OPENING,
+    SessionPhase.MORNING,
+    SessionPhase.AFTERNOON,
+})
+
+
+class SessionStateManager:
+    """
+    Thread-safe NSE market phase tracker.
+
+    Uses fixed IST timezone (independent of VPS system timezone). Handles
+    weekends automatically. Holidays must be provided by caller as a list
+    of 'YYYY-MM-DD' date strings (there is no built-in NSE holiday
+    calendar — user can update this list annually).
+
+    Basic use:
+        mgr = SessionStateManager()
+        phase = mgr.get_phase(time.time())
+        if mgr.is_tradeable(time.time()):
+            # accept signal
+            ...
+
+    Phase boundaries can be overridden if NSE changes hours in future:
+        mgr = SessionStateManager(phase_overrides={
+            SessionPhase.CLOSING: (dt_time(15, 25), dt_time(15, 30)),
+        })
+    """
+
+    # (start_inclusive, end_exclusive) for each phase (IST local time)
+    _DEFAULT_BOUNDARIES: Dict[SessionPhase, Tuple[dt_time, dt_time]] = {
+        SessionPhase.PRE_OPEN_ENTRY: (dt_time(9,  0), dt_time(9,  8)),
+        SessionPhase.PRE_OPEN_MATCH: (dt_time(9,  8), dt_time(9, 15)),
+        SessionPhase.OPENING:        (dt_time(9, 15), dt_time(9, 30)),
+        SessionPhase.MORNING:        (dt_time(9, 30), dt_time(11, 30)),
+        SessionPhase.LUNCH:          (dt_time(11, 30), dt_time(13, 30)),
+        SessionPhase.AFTERNOON:      (dt_time(13, 30), dt_time(15, 0)),
+        SessionPhase.PRE_CLOSE:      (dt_time(15,  0), dt_time(15, 20)),
+        SessionPhase.CLOSING:        (dt_time(15, 20), dt_time(15, 30)),
+        SessionPhase.POST_CLOSE:     (dt_time(15, 30), dt_time(16, 0)),
+    }
+
+    # Time at which we want to forcibly stop opening new positions
+    # regardless of phase (safety cutoff — no last-15-min entries)
+    DEFAULT_NO_NEW_ENTRY_AFTER: dt_time = dt_time(15, 15)
+
+    def __init__(
+        self,
+        holidays: Optional[Iterable[str]] = None,
+        phase_overrides: Optional[Dict[SessionPhase, Tuple[dt_time, dt_time]]] = None,
+        no_new_entry_after: Optional[dt_time] = None,
+    ):
+        self._holidays: Set[str] = set(holidays or [])
+        # Validate holiday format 'YYYY-MM-DD'
+        for h in list(self._holidays):
+            try:
+                datetime.strptime(h, "%Y-%m-%d")
+            except ValueError:
+                logger.warning("Invalid holiday date '%s' — skipped (expected YYYY-MM-DD)", h)
+                self._holidays.discard(h)
+
+        self._boundaries: Dict[SessionPhase, Tuple[dt_time, dt_time]] = dict(
+            self._DEFAULT_BOUNDARIES
+        )
+        if phase_overrides:
+            self._boundaries.update(phase_overrides)
+
+        self.no_new_entry_after: dt_time = (
+            no_new_entry_after or self.DEFAULT_NO_NEW_ENTRY_AFTER
+        )
+
+        # Per-day tracking (for stats)
+        self._lock = threading.RLock()
+        self._phase_hits: Dict[SessionPhase, int] = defaultdict(int)
+        self._last_phase: Optional[SessionPhase] = None
+        self._phase_transitions: int = 0
+
+    # ------- Core API -------
+
+    def get_phase(self, ts: float) -> SessionPhase:
+        """
+        Return NSE phase for given Unix timestamp (UTC seconds).
+        Thread-safe. Also updates internal transition stats.
+        """
+        dt = datetime.fromtimestamp(ts, tz=_IST)
+        wd = dt.weekday()   # Monday=0 ... Sunday=6
+
+        # -- Weekend --
+        if wd >= 5:
+            return self._record(SessionPhase.WEEKEND)
+
+        # -- Holiday --
+        if dt.strftime("%Y-%m-%d") in self._holidays:
+            return self._record(SessionPhase.HOLIDAY)
+
+        # -- Match trading-day phase by local time --
+        local_t = dt.time()
+        for phase, (start, end) in self._boundaries.items():
+            if start <= local_t < end:
+                return self._record(phase)
+
+        # -- Outside all phases (before 9:00, after 16:00, etc.) --
+        return self._record(SessionPhase.CLOSED)
+
+    def is_tradeable(
+        self,
+        ts: float,
+        allowed_phases: Optional[FrozenSet[SessionPhase]] = None,
+        enforce_no_new_entry_cutoff: bool = True,
+    ) -> Tuple[bool, str]:
+        """
+        Returns (allowed, reason).
+        reason string is empty when allowed, otherwise explains why blocked.
+        """
+        if allowed_phases is None:
+            allowed_phases = DEFAULT_TRADEABLE_PHASES
+
+        phase = self.get_phase(ts)
+        if phase not in allowed_phases:
+            return False, f"phase={phase.value}"
+
+        if enforce_no_new_entry_cutoff:
+            dt = datetime.fromtimestamp(ts, tz=_IST)
+            if dt.weekday() < 5 and dt.time() >= self.no_new_entry_after:
+                return False, f"after_no_entry_cutoff({self.no_new_entry_after})"
+
+        return True, ""
+
+    def seconds_to_close(self, ts: float, close_time: dt_time = dt_time(15, 30)) -> float:
+        """
+        Seconds remaining until market close (15:30 IST by default) on the
+        current trading day. Returns 0.0 if market already closed.
+        """
+        dt = datetime.fromtimestamp(ts, tz=_IST)
+        if dt.weekday() >= 5 or dt.strftime("%Y-%m-%d") in self._holidays:
+            return 0.0
+        target = dt.replace(
+            hour=close_time.hour, minute=close_time.minute,
+            second=0, microsecond=0,
+        )
+        return max(0.0, (target - dt).total_seconds())
+
+    def add_holiday(self, date_str: str) -> None:
+        try:
+            datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            raise ValueError(f"Invalid holiday '{date_str}', expected YYYY-MM-DD")
+        with self._lock:
+            self._holidays.add(date_str)
+
+    def stats(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "current_phase": self._last_phase.value if self._last_phase else None,
+                "phase_transitions": self._phase_transitions,
+                "phase_hits": {p.value: c for p, c in self._phase_hits.items() if c > 0},
+                "holidays_configured": sorted(self._holidays),
+                "no_new_entry_after": self.no_new_entry_after.strftime("%H:%M"),
+            }
+
+    # ------- Internal -------
+
+    def _record(self, phase: SessionPhase) -> SessionPhase:
+        with self._lock:
+            self._phase_hits[phase] += 1
+            if self._last_phase != phase:
+                self._phase_transitions += 1
+                self._last_phase = phase
+        return phase
+
+
+class RVOLCalculator:
+    """
+    Rolling Relative Volume (RVOL) tracker per symbol.
+
+    Compares current-minute traded volume against the average of the
+    previous N minutes. RVOL > 1.5 = elevated activity, > 3.0 = unusual.
+    Signals during high RVOL are typically more reliable because there's
+    genuine two-sided interest driving prices — not thin-book noise.
+
+    Usage:
+        rvol = RVOLCalculator(window_minutes=20, bucket_seconds=60)
+
+        # On every incoming tick (from any thread):
+        rvol.on_tick(symbol, snap.volume_traded, snap.timestamp)
+
+        # On every signal fire:
+        r = rvol.get_rvol(symbol, ts)
+        if r is None or r < 1.5:
+            # skip / lower confidence
+            ...
+
+    Session reset:
+        A NEGATIVE delta (current_cum < prev_cum) is treated as start of
+        a new trading session (day rollover). All buckets cleared, baseline
+        re-established. This prevents yesterday's cumulative volume from
+        polluting today's RVOL.
+
+    Warmup:
+        Returns None until at least `warmup_buckets` prior-minute buckets
+        have been accumulated. Also returns None if the current bucket
+        is less than `min_bucket_age_sec` old (too noisy to project).
+
+    Rate adjustment:
+        Current bucket volume is scaled by (bucket_seconds / bucket_age)
+        to compare apples-to-apples against completed buckets.
+    """
+
+    def __init__(
+        self,
+        window_minutes: int = 20,
+        bucket_seconds: int = 60,
+        warmup_buckets: int = 5,
+        min_bucket_age_sec: float = 5.0,
+        max_delta_sanity: int = 100_000_000,  # single-tick vol > 100M = anomaly
+    ):
+        if window_minutes < 2:
+            raise ValueError("window_minutes must be >= 2")
+        if bucket_seconds < 1:
+            raise ValueError("bucket_seconds must be >= 1")
+        if warmup_buckets < 1:
+            raise ValueError("warmup_buckets must be >= 1")
+        if warmup_buckets > window_minutes:
+            raise ValueError("warmup_buckets cannot exceed window_minutes")
+
+        self.window_minutes = window_minutes
+        self.bucket_seconds = bucket_seconds
+        self.warmup_buckets = warmup_buckets
+        self.min_bucket_age_sec = min_bucket_age_sec
+        self.max_delta_sanity = max_delta_sanity
+
+        self._lock = threading.RLock()
+        self._prev_cum: Dict[str, int] = {}
+        self._buckets: Dict[str, Deque[int]] = defaultdict(
+            lambda: deque(maxlen=window_minutes)
+        )
+        # symbol → (bucket_start_ts, current_bucket_volume)
+        self._current: Dict[str, Tuple[int, int]] = {}
+
+        # Stats
+        self.total_ticks_processed: int = 0
+        self.session_resets: int = 0
+        self.anomalies_capped: int = 0
+        self.rvol_queries: int = 0
+        self.rvol_returns_none: int = 0
+
+    # ------- Core API -------
+
+    def on_tick(self, symbol: str, cumulative_volume: int, ts: float) -> None:
+        """
+        Update RVOL state with cumulative day volume from a tick.
+
+        Feed this from your tick handler for every tick where
+        `cumulative_volume` is available (Angel One SnapQuote provides
+        `volume_trade_for_the_day`).
+        """
+        if cumulative_volume < 0:
+            return  # defensive: reject nonsensical negative cumulative
+        with self._lock:
+            self.total_ticks_processed += 1
+
+            prev = self._prev_cum.get(symbol)
+            if prev is None:
+                # First observation for this symbol — baseline only,
+                # don't count as delta (we don't know when day started)
+                self._prev_cum[symbol] = cumulative_volume
+                return
+
+            delta = cumulative_volume - prev
+            self._prev_cum[symbol] = cumulative_volume
+
+            # Session reset detection: cumulative went DOWN → new day
+            if delta < 0:
+                self.session_resets += 1
+                self._buckets[symbol].clear()
+                self._current.pop(symbol, None)
+                return
+
+            if delta == 0:
+                # No new trades this tick — still may need to roll bucket
+                # forward if time advanced past current bucket end
+                self._maybe_roll_bucket(symbol, ts, add_volume=0)
+                return
+
+            # Sanity cap on outlier delta (data glitch protection)
+            if delta > self.max_delta_sanity:
+                self.anomalies_capped += 1
+                delta = self.max_delta_sanity
+
+            self._maybe_roll_bucket(symbol, ts, add_volume=delta)
+
+    def get_rvol(self, symbol: str, ts: float) -> Optional[float]:
+        """
+        Return current RVOL, or None if not enough data yet.
+
+        RVOL = projected_current_bucket_volume / mean(prior N buckets)
+        where projected_current = actual × (bucket_seconds / bucket_age).
+        """
+        with self._lock:
+            self.rvol_queries += 1
+
+            cur = self._current.get(symbol)
+            if cur is None:
+                self.rvol_returns_none += 1
+                return None
+
+            prior = self._buckets[symbol]
+            if len(prior) < self.warmup_buckets:
+                self.rvol_returns_none += 1
+                return None
+
+            bucket_start, current_vol = cur
+            bucket_age = ts - bucket_start
+
+            # If bucket_age negative (ts went backwards) or too small, skip
+            if bucket_age < self.min_bucket_age_sec:
+                # But if we have no volume yet, definitionally rvol = 0
+                if current_vol == 0:
+                    return 0.0
+                self.rvol_returns_none += 1
+                return None
+
+            avg_prior = statistics.mean(prior)
+            if avg_prior <= 0:
+                # All prior buckets were zero — either brand-new session
+                # or thinly-traded symbol. If current has ANY volume,
+                # rvol is "infinite" — cap at 10x. If zero, return 0.
+                if current_vol > 0:
+                    return 10.0
+                return 0.0
+
+            # Cap bucket_age at bucket_seconds so we don't over-project
+            # if a bucket was somehow not rolled (should be rare)
+            effective_age = min(bucket_age, float(self.bucket_seconds))
+            projected = current_vol * (self.bucket_seconds / max(effective_age, 1.0))
+            return projected / avg_prior
+
+    def is_ready(self, symbol: str) -> bool:
+        """True if we have enough buckets to return a meaningful RVOL."""
+        with self._lock:
+            return len(self._buckets.get(symbol, ())) >= self.warmup_buckets
+
+    def stats(self) -> Dict[str, Any]:
+        with self._lock:
+            ready_syms = sum(
+                1 for s in self._buckets
+                if len(self._buckets[s]) >= self.warmup_buckets
+            )
+            return {
+                "symbols_tracked": len(self._prev_cum),
+                "symbols_warmed_up": ready_syms,
+                "ticks_processed": self.total_ticks_processed,
+                "session_resets": self.session_resets,
+                "anomalies_capped": self.anomalies_capped,
+                "rvol_queries": self.rvol_queries,
+                "rvol_returns_none": self.rvol_returns_none,
+                "window_minutes": self.window_minutes,
+                "bucket_seconds": self.bucket_seconds,
+                "warmup_buckets": self.warmup_buckets,
+            }
+
+    # ------- Internal -------
+
+    def _maybe_roll_bucket(self, symbol: str, ts: float, add_volume: int) -> None:
+        """Called under lock. Adds volume to current bucket, rolling if needed."""
+        bucket_start = int(ts // self.bucket_seconds) * self.bucket_seconds
+        cur = self._current.get(symbol)
+
+        if cur is None:
+            # First bucket for this symbol
+            self._current[symbol] = (bucket_start, add_volume)
+            return
+
+        current_start, current_vol = cur
+
+        if bucket_start == current_start:
+            # Same bucket — accumulate
+            self._current[symbol] = (current_start, current_vol + add_volume)
+            return
+
+        if bucket_start < current_start:
+            # Clock skew (ts went backwards). Ignore — keep existing bucket.
+            return
+
+        # New bucket — close old one, push to history
+        self._buckets[symbol].append(current_vol)
+
+        # Fill any gap buckets with zero (dead time between activity)
+        gap_buckets = (bucket_start - current_start) // self.bucket_seconds - 1
+        if gap_buckets > 0:
+            # Cap gap fill at window_minutes to avoid unbounded fills
+            for _ in range(min(gap_buckets, self.window_minutes)):
+                self._buckets[symbol].append(0)
+
+        self._current[symbol] = (bucket_start, add_volume)
 
 
 # ---------------------------------------------------------------------------

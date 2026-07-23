@@ -47,7 +47,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Deque, Dict, FrozenSet, List, Optional, Set, Tuple
 
 # Import scanner components (same folder)
 from nse_book_scanner import (
@@ -60,6 +60,9 @@ from nse_book_scanner import (
     ScannerConfig, load_config, setup_logging,
     AngelOneWSAdapter, AngelOneConnector,
     SMARTAPI_AVAILABLE,
+    # Optional signal quality gates:
+    SessionStateManager, SessionPhase, RVOLCalculator,
+    DEFAULT_TRADEABLE_PHASES,
 )
 
 
@@ -614,6 +617,23 @@ class PaperExecutor:
         self.cooldown: Optional[CooldownManager] = None
         self.entries_blocked_by_cooldown: int = 0
 
+        # -- Session phase gate (optional) --
+        # Blocks entries during LUNCH / PRE_OPEN / CLOSING and after
+        # 15:15 no-entry cutoff. Set via attach_session_manager() below,
+        # or directly (dual-analyzer shares one across both tools).
+        self.session_manager: Optional[SessionStateManager] = None
+        self.allowed_phases: FrozenSet[SessionPhase] = DEFAULT_TRADEABLE_PHASES
+        self.entries_blocked_by_session: int = 0
+
+        # -- RVOL gate (optional) --
+        # Blocks entries when relative volume is below min_rvol threshold.
+        # min_rvol = 0.0 → disabled (default).
+        self.rvol_calculator: Optional[RVOLCalculator] = None
+        self.min_rvol: float = 0.0
+        self.strict_rvol_warmup: bool = False
+        self.entries_blocked_by_low_rvol: int = 0
+        self.entries_allowed_during_rvol_warmup: int = 0
+
         self.positions: Dict[str, Position] = {}    # symbol → position
         self.closed_trades: List[ClosedTrade] = []
         self.equity_curve: List[Tuple[float, float]] = [(0.0, capital)]
@@ -647,6 +667,36 @@ class PaperExecutor:
             self._trades_log.close()
         if self._equity_log:
             self._equity_log.close()
+
+    # -- Optional signal-quality-gate attachment helpers --
+
+    def attach_session_manager(
+        self,
+        session_manager: SessionStateManager,
+        allowed_phases: Optional[FrozenSet[SessionPhase]] = None,
+    ) -> None:
+        """
+        Enable session-phase filtering. Entries during non-allowed phases
+        (LUNCH etc.) or after 15:15 no-entry cutoff will be blocked.
+        """
+        self.session_manager = session_manager
+        if allowed_phases is not None:
+            self.allowed_phases = allowed_phases
+
+    def attach_rvol_calculator(
+        self,
+        rvol_calculator: RVOLCalculator,
+        min_rvol: float = 1.5,
+        strict_warmup: bool = False,
+    ) -> None:
+        """
+        Enable RVOL filtering. Entries when current RVOL < min_rvol will
+        be blocked. During RVOL warm-up, entries are allowed unless
+        strict_warmup=True.
+        """
+        self.rvol_calculator = rvol_calculator
+        self.min_rvol = float(min_rvol)
+        self.strict_rvol_warmup = bool(strict_warmup)
 
     def on_signal(self, symbol: str, result: SignalResult, ltp: float, ts: float) -> None:
         """
@@ -730,6 +780,33 @@ class PaperExecutor:
             allowed, cd_reason = self.cooldown.can_enter(symbol, side, ts)
             if not allowed:
                 self.entries_blocked_by_cooldown += 1
+                return
+
+        # -- SESSION PHASE GATE (optional) --
+        # Block entries during LUNCH / PRE_OPEN / CLOSING (or user-defined)
+        # and past no-entry cutoff (default 15:15 IST).
+        if self.session_manager is not None:
+            ok, _reason = self.session_manager.is_tradeable(
+                ts, allowed_phases=self.allowed_phases,
+                enforce_no_new_entry_cutoff=True,
+            )
+            if not ok:
+                self.entries_blocked_by_session += 1
+                return
+
+        # -- RVOL GATE (optional) --
+        # Block entries when relative volume is below threshold.
+        # Only active when min_rvol > 0 AND rvol_calculator is set.
+        if self.rvol_calculator is not None and self.min_rvol > 0.0:
+            current_rvol = self.rvol_calculator.get_rvol(symbol, ts)
+            if current_rvol is None:
+                # RVOL not warmed up yet
+                if self.strict_rvol_warmup:
+                    self.entries_blocked_by_low_rvol += 1
+                    return
+                self.entries_allowed_during_rvol_warmup += 1
+            elif current_rvol < self.min_rvol:
+                self.entries_blocked_by_low_rvol += 1
                 return
 
         # Slippage-adjusted entry price
@@ -951,6 +1028,12 @@ class PaperTradingSession:
             self.last_sim_ts = snap.timestamp
             self.last_prices[symbol] = snap.ltp
 
+            # Feed RVOL tracker with cumulative day volume (no-op if not attached)
+            if self.executor.rvol_calculator is not None:
+                self.executor.rvol_calculator.on_tick(
+                    symbol, snap.volume_traded, snap.timestamp,
+                )
+
             # Executor's price-based checks (SL/TP/max-hold)
             self.executor.on_tick(symbol, snap.ltp, snap.timestamp)
 
@@ -1114,7 +1197,42 @@ def generate_report(session: PaperTradingSession) -> str:
     lines.append(f"  Entry attempts (score/evidence pass)  : {ex.entries_attempted:>7,}")
     lines.append(f"  Rejected (max concurrent positions)   : {ex.entries_rejected_slots:>7,}")
     lines.append(f"  Rejected (insufficient capital)       : {ex.entries_rejected_capital:>7,}")
+    lines.append(f"  Blocked by cooldown                   : {ex.entries_blocked_by_cooldown:>7,}"
+                 f"  ({'ENABLED' if ex.cooldown else 'gate disabled'})")
+    lines.append(f"  Blocked by session phase              : {ex.entries_blocked_by_session:>7,}"
+                 f"  ({'ENABLED' if ex.session_manager else 'gate disabled'})")
+    lines.append(f"  Blocked by low RVOL                   : {ex.entries_blocked_by_low_rvol:>7,}"
+                 f"  ({'ENABLED @ ' + str(ex.min_rvol) if ex.min_rvol > 0 else 'gate disabled'})")
+    if ex.rvol_calculator is not None:
+        lines.append(f"  Entries allowed during RVOL warmup    : {ex.entries_allowed_during_rvol_warmup:>7,}")
     lines.append(f"  Executed trades (round-trip complete) : {n_trades:>7,}")
+
+    # -- Signal-quality-gate detail sections --
+    if ex.session_manager is not None:
+        ss = ex.session_manager.stats()
+        lines.append("")
+        lines.append("─" * W)
+        lines.append("  🕐 SESSION PHASE STATS")
+        lines.append("─" * W)
+        lines.append(f"  Current phase        : {ss['current_phase']}")
+        lines.append(f"  Total transitions    : {ss['phase_transitions']}")
+        lines.append(f"  Allowed phases       : "
+                     f"{', '.join(p.name for p in sorted(ex.allowed_phases, key=lambda x: x.name))}")
+        lines.append(f"  No-entry cutoff      : {ss['no_new_entry_after']}")
+        lines.append(f"  Holidays configured  : {', '.join(ss['holidays_configured']) or '(none)'}")
+
+    if ex.rvol_calculator is not None:
+        rs = ex.rvol_calculator.stats()
+        lines.append("")
+        lines.append("─" * W)
+        lines.append("  📊 RELATIVE VOLUME (RVOL) STATS")
+        lines.append("─" * W)
+        lines.append(f"  Min RVOL threshold   : {ex.min_rvol:.2f}")
+        lines.append(f"  Symbols tracked      : {rs['symbols_tracked']}")
+        lines.append(f"  Symbols warmed up    : {rs['symbols_warmed_up']}")
+        lines.append(f"  Ticks processed      : {rs['ticks_processed']:,}")
+        lines.append(f"  Session resets       : {rs['session_resets']}")
+        lines.append(f"  Anomalies capped     : {rs['anomalies_capped']}")
 
     if n_trades == 0:
         lines.append("")
@@ -1347,6 +1465,34 @@ Examples:
                         "invert signals in MEAN_REVERTING, adapt thresholds & "
                         "size by volatility regime.")
 
+    # -- Signal quality gates (OPTIONAL — all default to disabled) --
+    p.add_argument("--session-filter", action="store_true",
+                   help="Enable NSE session phase filter. Block entries "
+                        "during LUNCH, PRE_OPEN, CLOSING, and past 15:15 "
+                        "no-entry cutoff. Default: disabled.")
+    p.add_argument("--allowed-phases",
+                   default="OPENING,MORNING,AFTERNOON",
+                   help="Comma-separated phase names allowed for entry when "
+                        "--session-filter is set. Default: "
+                        "OPENING,MORNING,AFTERNOON")
+    p.add_argument("--holidays", default="",
+                   help="Comma-separated trading holidays (YYYY-MM-DD).")
+    p.add_argument("--no-entry-cutoff", default="15:15",
+                   help="HH:MM after which no new entries (IST). Default 15:15.")
+
+    p.add_argument("--min-rvol", type=float, default=0.0,
+                   help="Minimum RVOL required for entry. 0.0 = disabled. "
+                        "1.5 = require 1.5× 20-min average. Higher = more "
+                        "selective. Recommended after live data collection: "
+                        "1.2 to 2.0.")
+    p.add_argument("--rvol-window-minutes", type=int, default=20,
+                   help="RVOL rolling window in minutes (default: 20)")
+    p.add_argument("--rvol-warmup-buckets", type=int, default=5,
+                   help="RVOL warm-up buckets needed (default: 5)")
+    p.add_argument("--rvol-strict-warmup", action="store_true",
+                   help="Block entries during RVOL warm-up (safest). "
+                        "Default: allow warm-up entries.")
+
     p.add_argument("--seed", type=int, default=42,
                    help="Random seed for simulate mode (default: 42)")
     args = p.parse_args()
@@ -1412,6 +1558,52 @@ Examples:
         scanner_config=scanner_config,
         regime_adaptive=args.regime_adaptive,
     )
+
+    # -- Attach optional signal-quality gates to executor --
+    if args.session_filter:
+        try:
+            hh, mm = args.no_entry_cutoff.split(":")
+            from datetime import time as _dt_time
+            cutoff = _dt_time(int(hh), int(mm))
+        except (ValueError, AttributeError):
+            print(f"\n❌ Invalid --no-entry-cutoff '{args.no_entry_cutoff}' "
+                  f"(expected HH:MM)\n", file=sys.stderr)
+            return 2
+        holidays = [h.strip() for h in args.holidays.split(",") if h.strip()]
+        session_mgr = SessionStateManager(
+            holidays=holidays, no_new_entry_after=cutoff,
+        )
+        # Parse allowed phases
+        allowed: Set[SessionPhase] = set()
+        for name in args.allowed_phases.split(","):
+            name = name.strip().upper()
+            if not name:
+                continue
+            try:
+                allowed.add(SessionPhase[name])
+            except KeyError:
+                print(f"\n❌ Invalid phase name '{name}'\n", file=sys.stderr)
+                return 2
+        session.executor.attach_session_manager(
+            session_mgr, allowed_phases=frozenset(allowed) if allowed else None,
+        )
+        logger.info(f"  Session filter : ENABLED "
+                    f"(allowed={sorted(p.name for p in allowed)}, "
+                    f"cutoff={args.no_entry_cutoff})")
+
+    if args.min_rvol > 0.0:
+        rvol_calc = RVOLCalculator(
+            window_minutes=args.rvol_window_minutes,
+            warmup_buckets=args.rvol_warmup_buckets,
+        )
+        session.executor.attach_rvol_calculator(
+            rvol_calc,
+            min_rvol=args.min_rvol,
+            strict_warmup=args.rvol_strict_warmup,
+        )
+        logger.info(f"  RVOL gate      : ENABLED "
+                    f"(min={args.min_rvol:.2f}, window={args.rvol_window_minutes}min"
+                    f"{', STRICT warmup' if args.rvol_strict_warmup else ''})")
 
     real_start = time.perf_counter()
     session.run()

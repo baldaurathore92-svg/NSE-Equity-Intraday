@@ -79,7 +79,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, FrozenSet, List, Optional, Set, Tuple
 
 # Reuse from other modules
 from nse_book_scanner import (
@@ -88,6 +88,9 @@ from nse_book_scanner import (
     _LONG_STATES, _SHORT_STATES, _ACTIONABLE_STATES,
     AngelOneConnector, AngelOneWSAdapter, ScannerConfig,
     load_config, setup_logging, SMARTAPI_AVAILABLE,
+    # Optional signal quality gates (shared across both analyzers):
+    SessionStateManager, SessionPhase, RVOLCalculator,
+    DEFAULT_TRADEABLE_PHASES,
 )
 from live_hit_rate_analyzer import (
     HitRateAnalyzer, LiveSignalMonitor, LiveSignal,
@@ -159,6 +162,12 @@ class DualAnalyzerSession:
         cooldown_seconds: float = 120.0,
         cooldown_flip_multiplier: float = 2.0,
         cooldown_sl_multiplier: float = 1.5,
+        # -- Shared signal-quality gates (both analyzers share ONE instance) --
+        session_manager: Optional[SessionStateManager] = None,
+        allowed_phases: Optional[FrozenSet[SessionPhase]] = None,
+        rvol_calculator: Optional[RVOLCalculator] = None,
+        min_rvol: float = 0.0,
+        strict_rvol_warmup: bool = False,
         # -- Logging --
         hit_rate_log_path: str = "logs/hit_rate_predictions.jsonl",
         paper_trades_log_path: str = "logs/paper_trades.jsonl",
@@ -185,17 +194,34 @@ class DualAnalyzerSession:
             stop_loss_multiplier=cooldown_sl_multiplier,
         )
 
-        # -- HitRateAnalyzer with shared cooldown --
+        # -- SHARED SIGNAL-QUALITY GATES --
+        # Both analyzers reference the SAME instances so they always filter
+        # the exact same set of signals → apples-to-apples comparison.
+        self.session_manager: Optional[SessionStateManager] = session_manager
+        self.rvol_calculator: Optional[RVOLCalculator] = rvol_calculator
+        self.allowed_phases: FrozenSet[SessionPhase] = (
+            allowed_phases if allowed_phases is not None
+            else DEFAULT_TRADEABLE_PHASES
+        )
+        self.min_rvol: float = float(min_rvol)
+        self.strict_rvol_warmup: bool = bool(strict_rvol_warmup)
+
+        # -- HitRateAnalyzer with shared cooldown + gates --
         self.hit_analyzer = HitRateAnalyzer(
             horizons_s=horizons_s,
             transaction_cost_pct=transaction_cost_pct,
             log_path=hit_rate_log_path,
             min_samples_for_verdict=min_samples_for_verdict,
             signal_dedup_seconds=signal_dedup_seconds,
-            cooldown=self.cooldown,   # ← SHARED
+            cooldown=self.cooldown,                # ← SHARED
+            session_manager=self.session_manager,  # ← SHARED
+            allowed_phases=self.allowed_phases,
+            rvol_calculator=self.rvol_calculator,  # ← SHARED
+            min_rvol=self.min_rvol,
         )
+        self.hit_analyzer.strict_rvol_warmup = self.strict_rvol_warmup
 
-        # -- PaperExecutor with shared cooldown --
+        # -- PaperExecutor with shared cooldown + gates --
         self.paper_executor = PaperExecutor(
             capital=capital,
             entry_score_threshold=entry_score_threshold,
@@ -212,6 +238,17 @@ class DualAnalyzerSession:
         )
         # Attach shared cooldown to executor
         self.paper_executor.cooldown = self.cooldown
+        # Attach shared session + RVOL gates (same instances as hit_analyzer)
+        if self.session_manager is not None:
+            self.paper_executor.attach_session_manager(
+                self.session_manager, allowed_phases=self.allowed_phases,
+            )
+        if self.rvol_calculator is not None:
+            self.paper_executor.attach_rvol_calculator(
+                self.rvol_calculator,
+                min_rvol=self.min_rvol,
+                strict_warmup=self.strict_rvol_warmup,
+            )
 
         # -- Angel One connector --
         self.connector = AngelOneConnector(config)
@@ -399,6 +436,14 @@ class DualAnalyzerSession:
                 self.dumper.dump(msg, True)
             self.symbols_seen.add(symbol)
             self.last_prices[symbol] = snap.ltp
+
+            # -- STEP 0: Feed shared RVOL with cumulative volume --
+            # Only ONE call needed: both analyzers reference the same
+            # rvol_calculator instance, so a single update covers both.
+            if self.rvol_calculator is not None:
+                self.rvol_calculator.on_tick(
+                    symbol, snap.volume_traded, snap.timestamp,
+                )
 
             # -- STEP 1: BOTH analyzers process the tick (SL/TP + horizon eval) --
             # Hit rate analyzer: evaluate pending predictions (real-time update)
@@ -787,6 +832,21 @@ def _print_headless_status(s: DualAnalyzerSession) -> None:
     pnl_pct = pnl / pe.starting_capital * 100
 
     ts_str = datetime.now(IST).strftime("%H:%M:%S")
+
+    # Build gate-block segment (only shows when at least one gate active)
+    gate_bits = []
+    if s.session_manager is not None:
+        gate_bits.append(
+            f"sess={s.hit_analyzer.signals_blocked_by_session}/"
+            f"{pe.entries_blocked_by_session}"
+        )
+    if s.rvol_calculator is not None and s.min_rvol > 0:
+        gate_bits.append(
+            f"rvol={s.hit_analyzer.signals_blocked_by_low_rvol}/"
+            f"{pe.entries_blocked_by_low_rvol}"
+        )
+    gate_str = ("  |  🛡 Gate blocks (hit/paper): " + ", ".join(gate_bits)) if gate_bits else ""
+
     print(
         f"[{ts_str} IST] ticks={s.total_ticks_received:,} "
         f"({s.ticks_per_second():.0f}/s) "
@@ -796,8 +856,9 @@ def _print_headless_status(s: DualAnalyzerSession) -> None:
         f"|  💰 PAPER: {len(pe.positions)} pos, {len(pe.closed_trades)} closed, "
         f"₹{pnl:+,.0f} ({pnl_pct:+.2f}%)  "
         f"|  🔒 Cooldown blocks: hit={s.hit_analyzer.signals_blocked_by_cooldown}, "
-        f"paper={pe.entries_blocked_by_cooldown}  "
-        f"|  lat p50/p99={p50_us:.0f}/{p99_us:.0f}µs",
+        f"paper={pe.entries_blocked_by_cooldown}"
+        f"{gate_str}"
+        f"  |  lat p50/p99={p50_us:.0f}/{p99_us:.0f}µs",
         flush=True,
     )
 
@@ -854,6 +915,48 @@ def generate_dual_eod_report(s: DualAnalyzerSession) -> str:
             lines.append(f"    {reason:<20} {count:,}")
     lines.append(f"  HitRate signals blocked : {s.hit_analyzer.signals_blocked_by_cooldown:,}")
     lines.append(f"  PaperExec entries blocked: {s.paper_executor.entries_blocked_by_cooldown:,}")
+
+    # -- Shared session-phase gate stats --
+    if s.session_manager is not None:
+        ss = s.session_manager.stats()
+        lines.append("")
+        lines.append("─" * W)
+        lines.append("  🕐 SESSION PHASE GATE (shared)")
+        lines.append("─" * W)
+        lines.append(f"  Current phase           : {ss['current_phase']}")
+        lines.append(f"  Total phase transitions : {ss['phase_transitions']}")
+        lines.append(f"  Allowed phases          : "
+                     f"{', '.join(p.name for p in sorted(s.allowed_phases, key=lambda x: x.name))}")
+        lines.append(f"  No-entry cutoff         : {ss['no_new_entry_after']}")
+        lines.append(f"  Holidays configured     : {', '.join(ss['holidays_configured']) or '(none)'}")
+        lines.append(f"  HitRate signals blocked : {s.hit_analyzer.signals_blocked_by_session:,}")
+        lines.append(f"  PaperExec entries blocked: {s.paper_executor.entries_blocked_by_session:,}")
+        if ss['phase_hits']:
+            lines.append(f"  Phase hit counts:")
+            for phase, count in sorted(ss['phase_hits'].items(),
+                                        key=lambda kv: -kv[1]):
+                lines.append(f"    {phase:<18} {count:,}")
+
+    # -- Shared RVOL gate stats --
+    if s.rvol_calculator is not None:
+        rs = s.rvol_calculator.stats()
+        lines.append("")
+        lines.append("─" * W)
+        lines.append("  📊 RELATIVE VOLUME (RVOL) GATE (shared)")
+        lines.append("─" * W)
+        lines.append(f"  Min RVOL threshold      : {s.min_rvol:.2f}"
+                     f"{' (gate ACTIVE)' if s.min_rvol > 0 else ' (informational only)'}")
+        lines.append(f"  Window                  : {rs['window_minutes']} min, "
+                     f"warmup {rs['warmup_buckets']} buckets")
+        lines.append(f"  Symbols tracked         : {rs['symbols_tracked']}")
+        lines.append(f"  Symbols warmed up       : {rs['symbols_warmed_up']}")
+        lines.append(f"  Ticks processed         : {rs['ticks_processed']:,}")
+        lines.append(f"  Session resets detected : {rs['session_resets']}")
+        lines.append(f"  Anomalies capped        : {rs['anomalies_capped']}")
+        lines.append(f"  RVOL queries            : {rs['rvol_queries']:,}")
+        lines.append(f"  RVOL returned None (warmup): {rs['rvol_returns_none']:,}")
+        lines.append(f"  HitRate signals blocked : {s.hit_analyzer.signals_blocked_by_low_rvol:,}")
+        lines.append(f"  PaperExec entries blocked: {s.paper_executor.entries_blocked_by_low_rvol:,}")
 
     # -- HIT RATE analyzer report --
     lines.append("")
@@ -1009,6 +1112,32 @@ Examples:
     p.add_argument("--sl-multiplier", type=float, default=1.5,
                    help="Post-stop-loss cooldown multiplier (default 1.5)")
 
+    # Shared signal-quality gates (both analyzers use same instances)
+    p.add_argument("--session-filter", action="store_true",
+                   help="Enable NSE session phase filter (block LUNCH, "
+                        "PRE_OPEN, CLOSING, past 15:15 cutoff). "
+                        "SHARED across both analyzers.")
+    p.add_argument("--allowed-phases",
+                   default="OPENING,MORNING,AFTERNOON",
+                   help="Phases allowed for signals/entries when "
+                        "--session-filter is set. Default: "
+                        "OPENING,MORNING,AFTERNOON")
+    p.add_argument("--holidays", default="",
+                   help="Comma-separated trading holidays (YYYY-MM-DD).")
+    p.add_argument("--no-entry-cutoff", default="15:15",
+                   help="HH:MM after which no new signals/entries (IST). "
+                        "Default 15:15.")
+    p.add_argument("--min-rvol", type=float, default=0.0,
+                   help="Minimum RVOL required. 0.0 = disabled. 1.5 = "
+                        "require 1.5× 20-min average. SHARED gate across "
+                        "both analyzers.")
+    p.add_argument("--rvol-window-minutes", type=int, default=20,
+                   help="RVOL rolling window in minutes (default: 20)")
+    p.add_argument("--rvol-warmup-buckets", type=int, default=5,
+                   help="RVOL warm-up buckets needed (default: 5)")
+    p.add_argument("--rvol-strict-warmup", action="store_true",
+                   help="Block signals/entries during RVOL warm-up.")
+
     # Diagnostic
     p.add_argument("--diagnose", action="store_true")
     p.add_argument("--dump-count", type=int, default=100)
@@ -1058,6 +1187,8 @@ def main() -> int:
     print(f"  Cooldown         : {args.cooldown_seconds:.0f}s (flip {args.flip_multiplier}×, "
           f"SL {args.sl_multiplier}×)")
     print(f"  Regime adaptive  : {'ON' if args.regime_adaptive else 'OFF'}")
+    print(f"  Session filter   : {'ON — ' + args.allowed_phases if args.session_filter else 'OFF'}")
+    print(f"  RVOL gate        : {'ON — min=' + str(args.min_rvol) if args.min_rvol > 0 else 'OFF'}")
     print(f"  Diagnostic mode  : {'ON' if args.diagnose else 'OFF'}")
     print("═" * 82)
 
@@ -1068,6 +1199,44 @@ def main() -> int:
 
     if not args.skip_market_hours_check and not is_market_hours():
         logger.warning("Outside NSE market hours. WebSocket may deliver no data.")
+
+    # -- Build optional signal-quality gates (SHARED across both analyzers) --
+    session_manager: Optional[SessionStateManager] = None
+    rvol_calculator: Optional[RVOLCalculator] = None
+    allowed_phases_set: Optional[FrozenSet[SessionPhase]] = None
+
+    if args.session_filter:
+        try:
+            hh, mm = args.no_entry_cutoff.split(":")
+            from datetime import time as _dt_time
+            cutoff = _dt_time(int(hh), int(mm))
+        except (ValueError, AttributeError):
+            print(f"\n❌ Invalid --no-entry-cutoff '{args.no_entry_cutoff}' "
+                  f"(expected HH:MM)\n", file=sys.stderr)
+            return 2
+        holidays = [h.strip() for h in args.holidays.split(",") if h.strip()]
+        session_manager = SessionStateManager(
+            holidays=holidays, no_new_entry_after=cutoff,
+        )
+        allowed: Set[SessionPhase] = set()
+        for name in args.allowed_phases.split(","):
+            name = name.strip().upper()
+            if not name:
+                continue
+            try:
+                allowed.add(SessionPhase[name])
+            except KeyError:
+                print(f"\n❌ Invalid phase name '{name}'. Options: "
+                      f"{', '.join(p.name for p in SessionPhase)}\n",
+                      file=sys.stderr)
+                return 2
+        allowed_phases_set = frozenset(allowed) if allowed else None
+
+    if args.min_rvol > 0.0:
+        rvol_calculator = RVOLCalculator(
+            window_minutes=args.rvol_window_minutes,
+            warmup_buckets=args.rvol_warmup_buckets,
+        )
 
     # Build session
     session = DualAnalyzerSession(
@@ -1087,6 +1256,11 @@ def main() -> int:
         cooldown_seconds=args.cooldown_seconds,
         cooldown_flip_multiplier=args.flip_multiplier,
         cooldown_sl_multiplier=args.sl_multiplier,
+        session_manager=session_manager,
+        allowed_phases=allowed_phases_set,
+        rvol_calculator=rvol_calculator,
+        min_rvol=args.min_rvol,
+        strict_rvol_warmup=args.rvol_strict_warmup,
         report_path=args.report_path,
         diagnose=args.diagnose,
         dump_count=args.dump_count,

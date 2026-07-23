@@ -74,7 +74,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, FrozenSet, List, Optional, Set, Tuple
 
 # Reuse from main scanner (single dependency)
 from nse_book_scanner import (
@@ -83,6 +83,9 @@ from nse_book_scanner import (
     _LONG_STATES, _SHORT_STATES, _ACTIONABLE_STATES,
     AngelOneConnector, AngelOneWSAdapter, ScannerConfig,
     load_config, setup_logging, SMARTAPI_AVAILABLE,
+    # Optional signal quality gates (new):
+    SessionStateManager, SessionPhase, RVOLCalculator,
+    DEFAULT_TRADEABLE_PHASES,
 )
 # CooldownManager reused from paper_trader (avoid duplication)
 from paper_trader import CooldownManager
@@ -843,6 +846,11 @@ class HitRateAnalyzer:
         min_samples_for_verdict: int = 20,
         signal_dedup_seconds: float = 5.0,
         cooldown: Optional["CooldownManager"] = None,
+        # ---- Optional signal-quality gates (all default to disabled) ----
+        session_manager: Optional[SessionStateManager] = None,
+        allowed_phases: Optional[FrozenSet[SessionPhase]] = None,
+        rvol_calculator: Optional[RVOLCalculator] = None,
+        min_rvol: float = 0.0,
     ):
         self.horizons = sorted(float(h) for h in horizons_s)
         self.cost = transaction_cost_pct
@@ -854,6 +862,32 @@ class HitRateAnalyzer:
         # → apples-to-apples comparison with paper trading stats.
         self.cooldown: Optional["CooldownManager"] = cooldown
         self.signals_blocked_by_cooldown: int = 0
+
+        # -- Session phase gate --
+        # When session_manager is set, signals fired during non-allowed
+        # phases (LUNCH by default, plus PRE_OPEN and CLOSING) are dropped.
+        # This filters out low-quality signals from times when book
+        # dynamics don't reflect fundamentals (lunch = thin liquidity;
+        # closing = squaring off, not directional intent).
+        self.session_manager: Optional[SessionStateManager] = session_manager
+        self.allowed_phases: FrozenSet[SessionPhase] = (
+            allowed_phases if allowed_phases is not None
+            else DEFAULT_TRADEABLE_PHASES
+        )
+        self.signals_blocked_by_session: int = 0
+
+        # -- RVOL gate --
+        # When rvol_calculator is set AND min_rvol > 0, signals fired when
+        # current RVOL for the symbol is below `min_rvol` are dropped
+        # (or when RVOL is unavailable — warm-up phase — signals are
+        # allowed by default, but this can be flipped via strict mode).
+        self.rvol_calculator: Optional[RVOLCalculator] = rvol_calculator
+        self.min_rvol: float = float(min_rvol)
+        # If True, block signals when RVOL is None (warm-up).
+        # Default False: allow warm-up signals but count them separately.
+        self.strict_rvol_warmup: bool = False
+        self.signals_blocked_by_low_rvol: int = 0
+        self.signals_allowed_during_rvol_warmup: int = 0
 
         # Guard: max_pending_age MUST be greater than the largest horizon,
         # otherwise long-horizon predictions would silently timeout before
@@ -970,6 +1004,33 @@ class HitRateAnalyzer:
             allowed, _ = self.cooldown.can_enter(symbol, side, ts)
             if not allowed:
                 self.signals_blocked_by_cooldown += 1
+                return
+
+        # -- SESSION PHASE GATE --
+        # Skip signals fired during non-tradeable phases (LUNCH etc.).
+        # is_tradeable() also enforces the "no new entry after 15:15" cutoff.
+        if self.session_manager is not None:
+            ok, _reason = self.session_manager.is_tradeable(
+                ts, allowed_phases=self.allowed_phases,
+                enforce_no_new_entry_cutoff=True,
+            )
+            if not ok:
+                self.signals_blocked_by_session += 1
+                return
+
+        # -- RVOL GATE --
+        # Skip signals fired during low-volume periods.
+        # Only active when min_rvol > 0 AND rvol_calculator is set.
+        if self.rvol_calculator is not None and self.min_rvol > 0.0:
+            current_rvol = self.rvol_calculator.get_rvol(symbol, ts)
+            if current_rvol is None:
+                # RVOL not yet warmed up for this symbol
+                if self.strict_rvol_warmup:
+                    self.signals_blocked_by_low_rvol += 1
+                    return
+                self.signals_allowed_during_rvol_warmup += 1
+            elif current_rvol < self.min_rvol:
+                self.signals_blocked_by_low_rvol += 1
                 return
 
         # Update dedup memory (record this event)
@@ -1260,6 +1321,14 @@ class LiveHitRateSession:
 
             self.symbols_seen.add(symbol)
             self.last_prices[symbol] = snap.ltp
+
+            # STEP 0: Feed RVOL tracker with cumulative volume
+            # (harmless if no RVOL gate active — analyzer.rvol_calculator
+            # will be None and this block skipped)
+            if self.analyzer.rvol_calculator is not None:
+                self.analyzer.rvol_calculator.on_tick(
+                    symbol, snap.volume_traded, snap.timestamp,
+                )
 
             # STEP 1: Evaluate any pending predictions for this symbol
             self.analyzer.on_tick(symbol, snap.ltp, snap.timestamp)
@@ -1743,9 +1812,53 @@ def generate_eod_report(session: LiveHitRateSession, analyzer: HitRateAnalyzer) 
     lines.append(f"  Signals recorded    : {analyzer.signals_recorded:,}")
     lines.append(f"  Signals deduped     : {analyzer.signals_deduped:,}  "
                  f"(same state within {analyzer.signal_dedup_seconds:.0f}s)")
+    lines.append(f"  Blocked by cooldown : {analyzer.signals_blocked_by_cooldown:,}")
+    lines.append(f"  Blocked by session  : {analyzer.signals_blocked_by_session:,}  "
+                 f"({'ENABLED' if analyzer.session_manager else 'gate disabled'})")
+    lines.append(f"  Blocked by low RVOL : {analyzer.signals_blocked_by_low_rvol:,}  "
+                 f"({'ENABLED @ min=' + str(analyzer.min_rvol) if analyzer.min_rvol > 0 else 'gate disabled'})")
+    if analyzer.rvol_calculator is not None:
+        lines.append(f"  RVOL warmup passes  : {analyzer.signals_allowed_during_rvol_warmup:,}  "
+                     f"(signals recorded while RVOL still warming up)")
     lines.append(f"  Predictions evaluated: {analyzer.predictions_evaluated:,}")
     lines.append(f"  Pending (not yet expired): {analyzer.pending_count():,}")
     lines.append(f"  Cost model          : -{analyzer.cost*100:.4f}% round-trip")
+
+    # -- Signal-quality-gate detail sections --
+    if analyzer.session_manager is not None:
+        ss = analyzer.session_manager.stats()
+        lines.append("")
+        lines.append("─" * W)
+        lines.append("  🕐 SESSION PHASE STATS")
+        lines.append("─" * W)
+        lines.append(f"  Current phase        : {ss['current_phase']}")
+        lines.append(f"  Total transitions    : {ss['phase_transitions']}")
+        lines.append(f"  Allowed phases       : "
+                     f"{', '.join(p.name for p in sorted(analyzer.allowed_phases, key=lambda x: x.name))}")
+        lines.append(f"  No-entry cutoff      : {ss['no_new_entry_after']}")
+        lines.append(f"  Holidays configured  : {', '.join(ss['holidays_configured']) or '(none)'}")
+        if ss['phase_hits']:
+            lines.append(f"  Phase hit counts:")
+            for phase, count in sorted(ss['phase_hits'].items(),
+                                        key=lambda kv: -kv[1]):
+                lines.append(f"    {phase:<18} {count:,}")
+
+    if analyzer.rvol_calculator is not None:
+        rs = analyzer.rvol_calculator.stats()
+        lines.append("")
+        lines.append("─" * W)
+        lines.append("  📊 RELATIVE VOLUME (RVOL) STATS")
+        lines.append("─" * W)
+        lines.append(f"  Min RVOL threshold   : {analyzer.min_rvol:.2f}"
+                     f"{' (gate ACTIVE)' if analyzer.min_rvol > 0 else ' (gate off)'}")
+        lines.append(f"  Symbols tracked      : {rs['symbols_tracked']}")
+        lines.append(f"  Symbols warmed up    : {rs['symbols_warmed_up']}")
+        lines.append(f"  Ticks processed      : {rs['ticks_processed']:,}")
+        lines.append(f"  Session resets       : {rs['session_resets']}")
+        lines.append(f"  Anomalies capped     : {rs['anomalies_capped']}")
+        lines.append(f"  RVOL queries         : {rs['rvol_queries']:,}")
+        lines.append(f"  RVOL returned None   : {rs['rvol_returns_none']:,}  "
+                     f"(warm-up / too-early bucket)")
 
     # Signal distribution
     lines.append("")
@@ -2055,6 +2168,43 @@ Examples:
                         "Same state fires within this window are ignored to "
                         "prevent memory/disk blowup during sustained signals.")
 
+    # -- Signal quality gates (OPTIONAL — all default to disabled) --
+    p.add_argument("--session-filter", action="store_true",
+                   help="Enable NSE session phase filter. Signals fired "
+                        "during LUNCH, PRE_OPEN, or after 15:15 (cutoff) are "
+                        "dropped. Default: disabled (record all phases). "
+                        "Recommended for production live use.")
+    p.add_argument("--allowed-phases",
+                   default="OPENING,MORNING,AFTERNOON",
+                   help="Comma-separated phase names to allow when "
+                        "--session-filter is set. Options: OPENING, MORNING, "
+                        "LUNCH, AFTERNOON, PRE_CLOSE, CLOSING. "
+                        "Default: OPENING,MORNING,AFTERNOON")
+    p.add_argument("--holidays", default="",
+                   help="Comma-separated trading holidays in YYYY-MM-DD "
+                        "format. Signals on these dates are blocked. "
+                        "Example: 2026-08-15,2026-10-02")
+    p.add_argument("--no-entry-cutoff", default="15:15",
+                   help="HH:MM after which no new signals recorded "
+                        "(IST). Default 15:15. Set to 15:30 to disable.")
+
+    p.add_argument("--min-rvol", type=float, default=0.0,
+                   help="Minimum Relative Volume required to record signal. "
+                        "0.0 = disabled (default). 1.5 = require 1.5× "
+                        "20-min average. Higher = more selective. "
+                        "Recommended after 10+ days of live data: 1.2 to 2.0.")
+    p.add_argument("--rvol-window-minutes", type=int, default=20,
+                   help="RVOL rolling window size in minutes (default: 20)")
+    p.add_argument("--rvol-warmup-buckets", type=int, default=5,
+                   help="RVOL warm-up buckets needed before signals gated. "
+                        "Default 5 (= 5 min for 1-min buckets). During "
+                        "warm-up, signals are allowed unless "
+                        "--rvol-strict-warmup is set.")
+    p.add_argument("--rvol-strict-warmup", action="store_true",
+                   help="If set, signals during RVOL warm-up are BLOCKED "
+                        "(safest for empirical testing). Default: allow "
+                        "warm-up signals but count separately in report.")
+
     # -- Real-market defensive diagnostics --
     p.add_argument("--diagnose", action="store_true",
                    help="Save first N raw WebSocket messages to logs/raw_ws_dump.jsonl "
@@ -2114,6 +2264,66 @@ def main() -> int:
     logger.info(f"  Max duration    : {args.duration_hours} hours")
     logger.info(f"  Log path        : {args.log_path}")
 
+    # ---- Optional signal quality gates ----
+    session_manager: Optional[SessionStateManager] = None
+    rvol_calculator: Optional[RVOLCalculator] = None
+    allowed_phases_set: Optional[FrozenSet[SessionPhase]] = None
+
+    if args.session_filter:
+        # Parse --no-entry-cutoff (HH:MM)
+        try:
+            hh, mm = args.no_entry_cutoff.split(":")
+            from datetime import time as _dt_time
+            cutoff = _dt_time(int(hh), int(mm))
+        except (ValueError, AttributeError):
+            print(f"\n❌ Invalid --no-entry-cutoff '{args.no_entry_cutoff}' "
+                  f"(expected HH:MM)\n", file=sys.stderr)
+            return 2
+
+        # Parse --holidays
+        holidays = [h.strip() for h in args.holidays.split(",") if h.strip()]
+        session_manager = SessionStateManager(
+            holidays=holidays,
+            no_new_entry_after=cutoff,
+        )
+
+        # Parse allowed phases
+        allowed_phases: Set[SessionPhase] = set()
+        for name in args.allowed_phases.split(","):
+            name = name.strip().upper()
+            if not name:
+                continue
+            try:
+                allowed_phases.add(SessionPhase[name])
+            except KeyError:
+                print(f"\n❌ Invalid phase name '{name}'. "
+                      f"Options: {', '.join(p.name for p in SessionPhase)}\n",
+                      file=sys.stderr)
+                return 2
+        allowed_phases_set = frozenset(allowed_phases) if allowed_phases else None
+        logger.info(f"  Session filter  : ENABLED "
+                    f"(allowed={sorted(p.name for p in allowed_phases)}, "
+                    f"cutoff={args.no_entry_cutoff}, "
+                    f"holidays={holidays})")
+    else:
+        logger.info(f"  Session filter  : disabled")
+
+    if args.min_rvol > 0.0:
+        rvol_calculator = RVOLCalculator(
+            window_minutes=args.rvol_window_minutes,
+            warmup_buckets=args.rvol_warmup_buckets,
+        )
+        logger.info(f"  RVOL gate       : ENABLED "
+                    f"(min_rvol={args.min_rvol:.2f}, "
+                    f"window={args.rvol_window_minutes}min, "
+                    f"warmup={args.rvol_warmup_buckets} buckets"
+                    f"{', STRICT warmup' if args.rvol_strict_warmup else ''})")
+    else:
+        # If session filter is on but RVOL not required, we STILL create
+        # the calculator so stats show up in the report (informational only).
+        # But NO gating. Skip creation to keep memory lean.
+        logger.info(f"  RVOL gate       : disabled")
+
     # Prerequisites
     if not SMARTAPI_AVAILABLE:
         print("\n❌ smartapi-python not installed. Run:\n"
@@ -2133,7 +2343,14 @@ def main() -> int:
         log_path=args.log_path,
         min_samples_for_verdict=args.min_samples,
         signal_dedup_seconds=args.dedup_seconds,
+        session_manager=session_manager,
+        allowed_phases=allowed_phases_set,
+        rvol_calculator=rvol_calculator,
+        min_rvol=args.min_rvol,
     )
+    # Propagate strict-warmup flag (constructor doesn't take it directly
+    # to keep signature small; setting attribute directly is cheap)
+    analyzer.strict_rvol_warmup = args.rvol_strict_warmup
 
     # Build session (with optional diagnostic dump)
     session = LiveHitRateSession(
