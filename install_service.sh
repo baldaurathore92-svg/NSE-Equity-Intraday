@@ -12,7 +12,22 @@
 
 set -e
 
-INSTALL_DIR="$HOME/nse_scanner"
+# --- sudo fallback (works when running as root without sudo installed) ---
+if [ "$EUID" -eq 0 ] && ! command -v sudo >/dev/null 2>&1; then
+    SUDO=""
+else
+    SUDO="sudo"
+fi
+
+# --- Detect install directory ---
+if [ -f "$HOME/nse_scanner/nse_book_scanner.py" ]; then
+    INSTALL_DIR="$HOME/nse_scanner"
+elif [ -f "$(dirname "$(readlink -f "$0")")/nse_book_scanner.py" ]; then
+    INSTALL_DIR="$(dirname "$(readlink -f "$0")")"
+else
+    INSTALL_DIR="$HOME/nse_scanner"
+fi
+
 SERVICE_NAME="nse-scanner"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
@@ -30,7 +45,7 @@ fi
 
 echo "▶ Creating systemd service file..."
 
-sudo tee "${SERVICE_FILE}" > /dev/null <<EOF
+$SUDO tee "${SERVICE_FILE}" > /dev/null <<EOF
 [Unit]
 Description=NSE Book Dynamics Real-Time Scanner
 After=network-online.target
@@ -66,8 +81,8 @@ WantedBy=multi-user.target
 EOF
 
 echo "▶ Reloading systemd..."
-sudo systemctl daemon-reload
-sudo systemctl enable "${SERVICE_NAME}"
+$SUDO systemctl daemon-reload
+$SUDO systemctl enable "${SERVICE_NAME}"
 
 echo ""
 echo "✓ Service installed: ${SERVICE_NAME}"

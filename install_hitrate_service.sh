@@ -9,7 +9,24 @@
 
 set -e
 
-INSTALL_DIR="$HOME/nse_scanner"
+# --- sudo fallback (works when running as root without sudo installed) ---
+if [ "$EUID" -eq 0 ] && ! command -v sudo >/dev/null 2>&1; then
+    SUDO=""
+else
+    SUDO="sudo"
+fi
+
+# --- Detect install directory ---
+# Prefer $HOME/nse_scanner (deploy_vps.sh default), fall back to script's
+# own directory (works when running from cloned repo like NSE-Equity-Intraday/)
+if [ -f "$HOME/nse_scanner/live_hit_rate_analyzer.py" ]; then
+    INSTALL_DIR="$HOME/nse_scanner"
+elif [ -f "$(dirname "$(readlink -f "$0")")/live_hit_rate_analyzer.py" ]; then
+    INSTALL_DIR="$(dirname "$(readlink -f "$0")")"
+else
+    INSTALL_DIR="$HOME/nse_scanner"   # will fail check below with proper message
+fi
+
 LOG_DIR="$INSTALL_DIR/logs"
 SERVICE_NAME="nse-hitrate-analyzer"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -17,6 +34,7 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 if [ ! -f "${INSTALL_DIR}/live_hit_rate_analyzer.py" ]; then
     echo "❌ live_hit_rate_analyzer.py not found in $INSTALL_DIR"
     echo "   पहले deploy_vps.sh + git pull चलाइए।"
+    echo "   Or manually: cd <repo>; ./install_hitrate_service.sh"
     exit 1
 fi
 
@@ -31,7 +49,7 @@ echo "▶ Log directory ready: $LOG_DIR"
 
 echo "▶ Creating systemd service: ${SERVICE_NAME}"
 
-sudo tee "${SERVICE_FILE}" > /dev/null <<EOF
+$SUDO tee "${SERVICE_FILE}" > /dev/null <<EOF
 [Unit]
 Description=NSE Live Hit Rate Analyzer — virtual trades on real Angel One data
 After=network-online.target
@@ -69,8 +87,8 @@ WantedBy=multi-user.target
 EOF
 
 echo "▶ Reloading systemd…"
-sudo systemctl daemon-reload
-sudo systemctl enable "${SERVICE_NAME}"
+$SUDO systemctl daemon-reload
+$SUDO systemctl enable "${SERVICE_NAME}"
 
 echo ""
 echo "✓ Service installed: ${SERVICE_NAME}"

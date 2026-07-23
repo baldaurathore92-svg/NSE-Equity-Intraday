@@ -15,8 +15,23 @@
 
 set -e
 
-INSTALL_DIR="$HOME/nse_scanner"
-DATA_DIR="$HOME/nse_data"
+# --- sudo fallback (works when running as root without sudo installed) ---
+if [ "$EUID" -eq 0 ] && ! command -v sudo >/dev/null 2>&1; then
+    SUDO=""
+else
+    SUDO="sudo"
+fi
+
+# --- Detect install directory (prefer $HOME/nse_scanner, fall back to script dir) ---
+if [ -f "$HOME/nse_scanner/tick_recorder.py" ]; then
+    INSTALL_DIR="$HOME/nse_scanner"
+elif [ -f "$(dirname "$(readlink -f "$0")")/tick_recorder.py" ]; then
+    INSTALL_DIR="$(dirname "$(readlink -f "$0")")"
+else
+    INSTALL_DIR="$HOME/nse_scanner"
+fi
+
+DATA_DIR="${DATA_DIR:-$HOME/nse_data}"
 SERVICE_NAME="nse-tick-recorder"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
@@ -37,7 +52,7 @@ echo "▶ Data directory ready: $DATA_DIR"
 
 echo "▶ Creating systemd service: ${SERVICE_NAME}"
 
-sudo tee "${SERVICE_FILE}" > /dev/null <<EOF
+$SUDO tee "${SERVICE_FILE}" > /dev/null <<EOF
 [Unit]
 Description=NSE Tick Recorder — captures live Angel One SnapQuote to gzip JSONL
 After=network-online.target
@@ -80,8 +95,8 @@ WantedBy=multi-user.target
 EOF
 
 echo "▶ Reloading systemd + enabling service…"
-sudo systemctl daemon-reload
-sudo systemctl enable "${SERVICE_NAME}"
+$SUDO systemctl daemon-reload
+$SUDO systemctl enable "${SERVICE_NAME}"
 
 echo ""
 echo "✓ Service installed: ${SERVICE_NAME}"

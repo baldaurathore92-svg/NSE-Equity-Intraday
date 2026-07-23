@@ -9,9 +9,30 @@
 #   2. scanner files upload करें (या git clone)
 #   3. chmod +x deploy_vps.sh && ./deploy_vps.sh
 #
+# Root user support:
+#   Root पर चलाना safe नहीं होता, लेकिन VPS providers अक्सर सिर्फ root
+#   access देते हैं। इस script में root allowed है (warning के साथ)।
+#   अगर आप root पर हैं और warning skip करना है:
+#      ./deploy_vps.sh --allow-root
+#
 
 set -e   # किसी भी step में error हो तो script रुक जाए
 set -u   # undefined variables से बचाव
+
+# --- Parse flags ---
+ALLOW_ROOT_FLAG="no"
+for arg in "$@"; do
+    case "$arg" in
+        --allow-root|-y|--yes) ALLOW_ROOT_FLAG="yes" ;;
+        --help|-h)
+            echo "Usage: ./deploy_vps.sh [--allow-root]"
+            echo ""
+            echo "  --allow-root, -y, --yes    Skip root user warning countdown"
+            echo "  --help, -h                 Show this help"
+            exit 0
+            ;;
+    esac
+done
 
 # --- Colors for readability ---
 RED='\033[0;31m'
@@ -36,32 +57,64 @@ echo "════════════════════════�
 echo -e "${NC}"
 
 # ----------------------------------------------------------------
-# 1. Check we're not running as root (security best practice)
+# 1. User check (root allowed with warning)
 # ----------------------------------------------------------------
 step "1/8  User check"
 if [ "$EUID" -eq 0 ]; then
-    error "Root user के रूप में मत चलाइए। एक normal user बनाइए:"
-    echo "    adduser trader"
-    echo "    usermod -aG sudo trader"
-    echo "    su - trader"
-    echo "फिर से script चलाइए।"
-    exit 1
+    warn "आप root user के रूप में चल रहे हैं।"
+    warn "यह production के लिए ideal नहीं है (security best practice: normal user)।"
+    warn "लेकिन कई VPS providers सिर्फ root access देते हैं, इसलिए script आगे बढ़ेगी।"
+    echo ""
+    echo "  Production security के लिए बाद में normal user बना सकते हैं:"
+    echo "     adduser trader"
+    echo "     usermod -aG sudo trader"
+    echo "     su - trader"
+    echo ""
+    if [ "$ALLOW_ROOT_FLAG" = "yes" ]; then
+        ok "Root user OK (--allow-root flag दिया गया है)"
+    else
+        # Give user 5 seconds to Ctrl+C if they want to abort
+        echo -e "${YELLOW}  Continuing in 5 seconds... (Ctrl+C to abort)${NC}"
+        for i in 5 4 3 2 1; do
+            echo -n "  $i "
+            sleep 1
+        done
+        echo ""
+        ok "Continuing as root: $USER"
+    fi
+
+    # When running as root, `sudo` is redundant but works. However some
+    # minimal Ubuntu images don't have sudo installed. Fallback: strip sudo.
+    if ! command -v sudo >/dev/null 2>&1; then
+        warn "sudo command not found on this system — will use direct commands"
+        SUDO=""
+    else
+        SUDO="sudo"
+    fi
+else
+    ok "Running as user: $USER"
+    if ! command -v sudo >/dev/null 2>&1; then
+        error "sudo command not installed। पहले root user से install करें:"
+        echo "    apt-get install sudo"
+        echo "फिर वापस normal user पर आएं।"
+        exit 1
+    fi
+    SUDO="sudo"
 fi
-ok "Running as user: $USER"
 
 # ----------------------------------------------------------------
 # 2. System update
 # ----------------------------------------------------------------
 step "2/8  System packages update"
-sudo apt-get update -qq
-sudo apt-get upgrade -y -qq
+$SUDO apt-get update -qq
+$SUDO apt-get upgrade -y -qq
 ok "System updated"
 
 # ----------------------------------------------------------------
 # 3. Install dependencies (Python, tmux, timezone tools)
 # ----------------------------------------------------------------
 step "3/8  Installing Python + tools"
-sudo apt-get install -y -qq \
+$SUDO apt-get install -y -qq \
     python3 \
     python3-pip \
     python3-venv \
@@ -79,7 +132,7 @@ echo "  Python version: $PYVER"
 # 4. Set timezone to IST (CRITICAL — market hours check depends on this)
 # ----------------------------------------------------------------
 step "4/8  Setting timezone to Asia/Kolkata (IST)"
-sudo timedatectl set-timezone Asia/Kolkata
+$SUDO timedatectl set-timezone Asia/Kolkata
 CURRENT_TZ=$(timedatectl show -p Timezone --value)
 if [ "$CURRENT_TZ" = "Asia/Kolkata" ]; then
     ok "Timezone set to IST: $(date)"
@@ -92,11 +145,11 @@ fi
 # ----------------------------------------------------------------
 step "5/8  Basic firewall (ufw)"
 if command -v ufw >/dev/null 2>&1; then
-    sudo ufw --force reset >/dev/null
-    sudo ufw default deny incoming >/dev/null
-    sudo ufw default allow outgoing >/dev/null
-    sudo ufw allow ssh >/dev/null
-    sudo ufw --force enable >/dev/null
+    $SUDO ufw --force reset >/dev/null
+    $SUDO ufw default deny incoming >/dev/null
+    $SUDO ufw default allow outgoing >/dev/null
+    $SUDO ufw allow ssh >/dev/null
+    $SUDO ufw --force enable >/dev/null
     ok "Firewall enabled (SSH allowed, all inbound denied)"
 else
     warn "ufw not installed, skipping firewall"
