@@ -185,6 +185,287 @@ class HitRateBucket:
 
 
 # ============================================================
+# 1b. LIVE SIGNAL — Real-time P&L tracking (per signal, not per horizon)
+# ============================================================
+
+@dataclass
+class LiveSignal:
+    """
+    One in-flight signal being tracked in real-time.
+
+    Updated on every incoming tick for its symbol until max horizon reached.
+    Tracks:
+      - Current directional return (positive = signal is proving RIGHT)
+      - MFE (max favorable excursion) — best moment signal was proved right
+      - MAE (max adverse excursion) — worst moment signal was proved wrong
+      - Which configured horizons have already been crossed + their returns
+
+    यह tool user को हर tick पर बताता है: "यह signal अभी सही जा रहा है या गलत?"
+    """
+    signal_id: int
+    symbol: str
+    state: str
+    smoothed_score: float
+    evidence: float
+    regime_label: str
+    price_at_signal: float
+    ts_fired: float
+    max_horizon_s: float                    # जब यह close होगा
+
+    # Live state (updated per tick)
+    current_price: float = 0.0
+    current_directional_return: float = 0.0 # +ve = correct, -ve = wrong
+    seconds_elapsed: float = 0.0
+    tick_count: int = 0                      # ticks seen since fire
+
+    # Excursions
+    max_favorable_excursion: float = 0.0    # best signed return during life
+    max_adverse_excursion: float = 0.0      # worst signed return during life
+    time_to_mfe_s: float = 0.0
+    time_to_mae_s: float = 0.0
+
+    # Horizon snapshots (filled as each horizon is crossed)
+    horizon_snapshots: Dict[float, float] = field(default_factory=dict)
+    # e.g., {5.0: +0.0012, 30.0: +0.0025, 60.0: -0.0003}
+
+    # Terminal state
+    is_closed: bool = False
+    close_reason: str = ""                   # "max_horizon" / "timeout"
+
+    @property
+    def is_currently_winning(self) -> bool:
+        return self.current_directional_return > 0
+
+    @property
+    def is_currently_net_profitable(self) -> bool:
+        # cost is not stored here; caller must compare
+        return False
+
+    def net_return(self, cost_pct: float) -> float:
+        return self.current_directional_return - cost_pct
+
+
+class LiveSignalMonitor:
+    """
+    Real-time tracker for open signals.
+
+    On every tick for a symbol:
+      - Update all open signals for that symbol
+      - Compute directional return, elapsed, excursions
+      - Snapshot at each horizon crossing
+      - Close (evict) when max horizon reached
+
+    Separate from HitRateAnalyzer's per-horizon evaluation:
+      - HitRateAnalyzer stats: WHERE horizon expired (statistical aggregates)
+      - LiveSignalMonitor: WHAT's happening NOW (real-time visibility)
+    """
+
+    def __init__(
+        self,
+        horizons_s: List[float],
+        cost_pct: float,
+        max_age_s: float = 600.0,
+    ):
+        self.horizons = sorted(float(h) for h in horizons_s)
+        self.max_horizon = max(self.horizons) if self.horizons else 60.0
+        self.cost = cost_pct
+        self.max_age_s = max(max_age_s, self.max_horizon + 30.0)
+
+        # Open signals keyed by signal_id
+        self._open: Dict[int, LiveSignal] = {}
+        # Per-symbol index for fast on_tick lookup
+        self._by_symbol: Dict[str, List[int]] = defaultdict(list)
+        self._counter = 0
+
+        # Recently closed signals (ring buffer for UI + report)
+        self.recently_closed: Deque[LiveSignal] = deque(maxlen=200)
+
+        # Global running stats
+        self.total_added = 0
+        self.total_closed = 0
+        self.total_max_horizon_closed = 0
+        self.total_timeout_closed = 0
+
+        # Concurrent access from worker + UI thread
+        self._lock = threading.RLock()
+
+    def add_signal(
+        self, symbol: str, state: str, smoothed_score: float,
+        evidence: float, regime_label: str,
+        price: float, ts: float,
+    ) -> int:
+        """Called when scanner fires an actionable signal. Returns new signal_id."""
+        with self._lock:
+            self._counter += 1
+            sig = LiveSignal(
+                signal_id=self._counter,
+                symbol=symbol,
+                state=state,
+                smoothed_score=smoothed_score,
+                evidence=evidence,
+                regime_label=regime_label,
+                price_at_signal=price,
+                ts_fired=ts,
+                max_horizon_s=self.max_horizon,
+                current_price=price,
+                current_directional_return=0.0,
+            )
+            self._open[sig.signal_id] = sig
+            self._by_symbol[symbol].append(sig.signal_id)
+            self.total_added += 1
+        return sig.signal_id
+
+    def on_tick(self, symbol: str, current_price: float, current_ts: float) -> List[LiveSignal]:
+        """
+        Update all open signals for `symbol`. Returns list of signals that
+        closed on this tick (max horizon reached).
+        """
+        if current_price <= 0:
+            return []
+
+        newly_closed: List[LiveSignal] = []
+        with self._lock:
+            ids_for_symbol = self._by_symbol.get(symbol)
+            if not ids_for_symbol:
+                return []
+
+            # Iterate a copy so we can mutate _open safely
+            still_open_ids = []
+            for sig_id in ids_for_symbol:
+                sig = self._open.get(sig_id)
+                if sig is None:
+                    continue   # already closed elsewhere
+
+                # Compute directional return
+                raw = (current_price - sig.price_at_signal) / sig.price_at_signal
+                directional = -raw if sig.state in _SHORT_STATES else raw
+                elapsed = current_ts - sig.ts_fired
+
+                sig.current_price = current_price
+                sig.current_directional_return = directional
+                sig.seconds_elapsed = elapsed
+                sig.tick_count += 1
+
+                # Update excursions
+                if directional > sig.max_favorable_excursion:
+                    sig.max_favorable_excursion = directional
+                    sig.time_to_mfe_s = elapsed
+                if directional < sig.max_adverse_excursion:
+                    sig.max_adverse_excursion = directional
+                    sig.time_to_mae_s = elapsed
+
+                # Snapshot at each horizon crossing (only once per horizon)
+                for h in self.horizons:
+                    if h not in sig.horizon_snapshots and elapsed >= h:
+                        sig.horizon_snapshots[h] = directional
+
+                # Close conditions
+                if elapsed >= sig.max_horizon_s:
+                    sig.is_closed = True
+                    sig.close_reason = "max_horizon"
+                    del self._open[sig_id]
+                    self.recently_closed.append(sig)
+                    newly_closed.append(sig)
+                    self.total_closed += 1
+                    self.total_max_horizon_closed += 1
+                elif elapsed > self.max_age_s:
+                    sig.is_closed = True
+                    sig.close_reason = "timeout"
+                    del self._open[sig_id]
+                    self.recently_closed.append(sig)
+                    newly_closed.append(sig)
+                    self.total_closed += 1
+                    self.total_timeout_closed += 1
+                else:
+                    still_open_ids.append(sig_id)
+
+            # Compact per-symbol index
+            self._by_symbol[symbol] = still_open_ids
+
+        return newly_closed
+
+    # -- Read APIs (UI + report) --
+
+    def open_count(self) -> int:
+        with self._lock:
+            return len(self._open)
+
+    def snapshot_open(self, top_n: int = 40) -> List[LiveSignal]:
+        """
+        Return snapshot of currently-open signals, sorted by:
+          1. Newest first (recency), then
+          2. Absolute directional return (biggest movers first)
+        Limited to top_n.
+        """
+        with self._lock:
+            # Shallow copy list of open LiveSignals for UI read
+            signals = list(self._open.values())
+        # Sort: newest first
+        signals.sort(key=lambda s: -s.ts_fired)
+        return signals[:top_n]
+
+    def live_verdict(self) -> Dict[str, Any]:
+        """Aggregate 'how are we doing right now?' stats across open signals."""
+        with self._lock:
+            open_snap = list(self._open.values())
+        if not open_snap:
+            return {
+                "total_open": 0,
+                "winning": 0,
+                "losing": 0,
+                "net_profitable": 0,
+                "hit_rate_pct": 0.0,
+                "net_profit_rate_pct": 0.0,
+                "avg_current_return_pct": 0.0,
+            }
+        winning = sum(1 for s in open_snap if s.current_directional_return > 0)
+        losing = sum(1 for s in open_snap if s.current_directional_return < 0)
+        net_prof = sum(1 for s in open_snap if s.current_directional_return > self.cost)
+        avg = sum(s.current_directional_return for s in open_snap) / len(open_snap)
+        return {
+            "total_open": len(open_snap),
+            "winning": winning,
+            "losing": losing,
+            "net_profitable": net_prof,
+            "hit_rate_pct": winning / len(open_snap) * 100,
+            "net_profit_rate_pct": net_prof / len(open_snap) * 100,
+            "avg_current_return_pct": avg * 100,
+        }
+
+    def excursion_stats(self) -> Dict[str, Dict[str, Any]]:
+        """Aggregate MFE/MAE stats by state — useful for TP/SL calibration."""
+        with self._lock:
+            closed_snap = list(self.recently_closed)
+        if not closed_snap:
+            return {}
+        by_state: Dict[str, List[LiveSignal]] = defaultdict(list)
+        for sig in closed_snap:
+            by_state[sig.state].append(sig)
+
+        result: Dict[str, Dict[str, Any]] = {}
+        for state, sigs in by_state.items():
+            if not sigs:
+                continue
+            n = len(sigs)
+            mfes = [s.max_favorable_excursion for s in sigs]
+            maes = [s.max_adverse_excursion for s in sigs]
+            times_mfe = [s.time_to_mfe_s for s in sigs]
+            times_mae = [s.time_to_mae_s for s in sigs]
+            final_rets = [s.current_directional_return for s in sigs]
+            result[state] = {
+                "n": n,
+                "avg_mfe_pct": (sum(mfes) / n) * 100,
+                "avg_mae_pct": (sum(maes) / n) * 100,
+                "avg_time_to_mfe_s": sum(times_mfe) / n,
+                "avg_time_to_mae_s": sum(times_mae) / n,
+                "avg_final_return_pct": (sum(final_rets) / n) * 100,
+                "median_mfe_pct": sorted(mfes)[n // 2] * 100,
+                "median_mae_pct": sorted(maes)[n // 2] * 100,
+            }
+        return result
+
+
+# ============================================================
 # 2. HIT RATE ANALYZER
 # ============================================================
 
@@ -214,8 +495,15 @@ class HitRateAnalyzer:
         self.log_path = Path(log_path)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Pending predictions per symbol
+        # Pending predictions per symbol (per-horizon, for statistical eval)
         self._pending: Dict[str, Deque[PendingPrediction]] = defaultdict(deque)
+
+        # Real-time live signal monitor (per-signal, for live UI)
+        self.live_monitor = LiveSignalMonitor(
+            horizons_s=self.horizons,
+            cost_pct=self.cost,
+            max_age_s=max_pending_age_s,
+        )
 
         # Multi-dimensional stats buckets
         self._stats_lock = threading.RLock()
@@ -271,7 +559,7 @@ class HitRateAnalyzer:
         # Regime label (Phase 2)
         regime_label = getattr(result.metrics.regime, "label", "unknown")
 
-        # Create pending at each horizon
+        # Create pending at each horizon (for statistical horizon-based eval)
         for h in self.horizons:
             self._pending[symbol].append(PendingPrediction(
                 symbol=symbol, state=state,
@@ -283,11 +571,32 @@ class HitRateAnalyzer:
                 horizon_seconds=h,
                 hour_of_day=hour,
             ))
+
+        # Also add to live monitor (per-signal, for real-time UI)
+        self.live_monitor.add_signal(
+            symbol=symbol,
+            state=state,
+            smoothed_score=result.smoothed_score,
+            evidence=result.evidence_strength,
+            regime_label=regime_label,
+            price=price,
+            ts=ts,
+        )
+
         self.signals_recorded += 1
 
     def on_tick(self, symbol: str, current_price: float, current_ts: float) -> None:
-        """Called on every tick. Evaluates any pending predictions whose
-        horizons have expired."""
+        """
+        Called on every tick. Two things happen:
+          1. LiveSignalMonitor.on_tick — updates real-time state of ALL open
+             signals for this symbol (current P&L, MFE, MAE, horizon snapshots)
+          2. Evaluate any pending predictions whose horizons have expired
+             → statistical stats update
+        """
+        # Real-time update (fast, always run)
+        self.live_monitor.on_tick(symbol, current_price, current_ts)
+
+        # Horizon-based statistical evaluation
         pending = self._pending.get(symbol)
         if not pending or current_price <= 0:
             return
@@ -567,6 +876,17 @@ class HitRateUI:
         m, sec = divmod(rem, 60)
         avg_us, p50_us, p99_us = s.latency_stats()
 
+        # Live verdict from the real-time monitor
+        verdict = self.analyzer.live_monitor.live_verdict()
+        live_open = verdict["total_open"]
+        winning = verdict["winning"]
+        losing = verdict["losing"]
+        hit_pct_now = verdict["hit_rate_pct"]
+        avg_ret_now = verdict["avg_current_return_pct"]
+        hit_style = ("bold green" if hit_pct_now > 55
+                     else "green" if hit_pct_now > 50
+                     else "red" if hit_pct_now < 50 else "white")
+
         line1 = Text.assemble(
             ("📊  NSE Live Hit Rate Analyzer", "bold cyan"),
             ("   |   ", "dim"),
@@ -579,18 +899,112 @@ class HitRateUI:
             (f"({s.ticks_per_second():.0f}/s)", "dim"),
             ("   |   ", "dim"),
             (f"Signals: {s.total_signals_computed:,}", "white"),
-            ("   |   ", "dim"),
-            (f"Pending: {self.analyzer.pending_count():,}", "yellow"),
         )
+        # LIVE VERDICT line — "is market moving as we predicted RIGHT NOW?"
         line2 = Text.assemble(
-            (f"Predictions evaluated: {self.analyzer.predictions_evaluated:,}", "bold magenta"),
+            ("⚡ LIVE VERDICT (open signals): ", "bold magenta"),
+            (f"{live_open} open ", "white"),
+            (f"→ {winning} winning ", "green"),
+            (f"/ {losing} losing", "red"),
             ("   |   ", "dim"),
-            (f"Latency p50={p50_us:.0f}µs p99={p99_us:.0f}µs", "white"),
+            ("Hit rate now: ", "white"),
+            (f"{hit_pct_now:>5.1f}%", hit_style),
             ("   |   ", "dim"),
-            (f"Cost model: -{self.analyzer.cost*100:.2f}% round-trip", "dim"),
+            ("Avg current: ", "white"),
+            (f"{avg_ret_now:+.3f}%",
+             "green" if avg_ret_now > 0 else "red"),
+            ("   |   ", "dim"),
+            (f"Evaluated: {self.analyzer.predictions_evaluated:,}", "dim"),
         )
-        return Panel(Align.center(Text.assemble(line1, "\n", line2)),
-                     border_style="cyan")
+        line3 = Text.assemble(
+            (f"Latency p50={p50_us:.0f}µs p99={p99_us:.0f}µs", "dim"),
+            ("   |   ", "dim"),
+            (f"Cost: -{self.analyzer.cost*100:.2f}%", "dim"),
+            ("   |   ", "dim"),
+            (f"Signals closed (max horizon): "
+             f"{self.analyzer.live_monitor.total_max_horizon_closed:,}", "dim"),
+        )
+        return Panel(Align.center(Text.assemble(line1, "\n", line2, "\n", line3)),
+                     border_style="magenta")
+
+    def _live_signals_panel(self) -> Table:
+        """
+        Real-time panel — every open signal with current status.
+        यह वो table है जो user चाहता है: "अभी scanner सही जा रहा है या गलत?"
+        """
+        signals = self.analyzer.live_monitor.snapshot_open(top_n=30)
+        cost_pct = self.analyzer.cost * 100
+
+        table = Table(
+            title=(f"⚡  LIVE OPEN SIGNALS  —  Real-time score verdict "
+                   f"(sign-adjusted; +ve = signal proving RIGHT)"),
+            title_style="bold cyan",
+            expand=True,
+            show_lines=False,
+            header_style="bold",
+        )
+        table.add_column("Symbol", style="cyan", width=13)
+        table.add_column("State", width=13)
+        table.add_column("Score", justify="right", width=7)
+        table.add_column("Evid", justify="right", width=6)
+        table.add_column("Age", justify="right", width=6)
+        table.add_column("Entry", justify="right", width=9)
+        table.add_column("Now", justify="right", width=9)
+        table.add_column("Dir Ret", justify="right", width=9)
+        table.add_column("MFE", justify="right", width=8)
+        table.add_column("MAE", justify="right", width=8)
+        table.add_column("Status", width=15)
+
+        if not signals:
+            table.caption = "No open signals yet — waiting for scanner to fire…"
+            table.caption_style = "dim"
+            return table
+
+        for sig in signals:
+            state_style = self.STATE_STYLE.get(sig.state, "white")
+            dir_pct = sig.current_directional_return * 100
+            mfe_pct = sig.max_favorable_excursion * 100
+            mae_pct = sig.max_adverse_excursion * 100
+
+            # Status determination
+            if sig.current_directional_return > cost_pct / 100:
+                status_text, status_style = "✓✓ PROFITABLE", "bold green"
+            elif sig.current_directional_return > 0:
+                status_text, status_style = "✓ winning", "green"
+            elif sig.current_directional_return > -0.001:
+                status_text, status_style = "~ flat", "yellow"
+            elif sig.current_directional_return > -0.003:
+                status_text, status_style = "✗ losing", "red"
+            else:
+                status_text, status_style = "✗✗ HEAVY LOSS", "bold red"
+
+            # Format age
+            age_s = int(sig.seconds_elapsed)
+            if age_s < 60:
+                age_str = f"{age_s}s"
+            else:
+                m, s_ = divmod(age_s, 60)
+                age_str = f"{m}m{s_}s"
+
+            dir_style = "green" if dir_pct > 0 else "red"
+            mfe_style = "green" if mfe_pct > 0 else "dim"
+            mae_style = "red" if mae_pct < 0 else "dim"
+
+            table.add_row(
+                sig.symbol,
+                Text(sig.state, style=state_style),
+                f"{sig.smoothed_score:+.2f}",
+                f"{sig.evidence:.0f}",
+                age_str,
+                f"{sig.price_at_signal:.2f}",
+                f"{sig.current_price:.2f}",
+                Text(f"{dir_pct:+.3f}%", style=dir_style),
+                Text(f"{mfe_pct:+.2f}%", style=mfe_style),
+                Text(f"{mae_pct:+.2f}%", style=mae_style),
+                Text(status_text, style=status_style),
+            )
+
+        return table
 
     def _state_horizon_table(self) -> Table:
         """Main table: state × horizon breakdown."""
@@ -719,12 +1133,15 @@ class HitRateUI:
 
     def _render(self) -> Layout:
         layout = Layout()
+        # 4-panel layout: header + LIVE open signals + horizon stats + hour breakdown
         layout.split_column(
-            Layout(name="header", size=4),
-            Layout(name="state_horizon", ratio=3),
+            Layout(name="header", size=5),
+            Layout(name="live_open", ratio=3),      # ⚡ New — real-time verdict
+            Layout(name="state_horizon", ratio=2),  # Statistical (horizon-based)
             Layout(name="hour", ratio=2),
         )
         layout["header"].update(self._header_panel())
+        layout["live_open"].update(self._live_signals_panel())
         layout["state_horizon"].update(self._state_horizon_table())
         layout["hour"].update(self._regime_hour_table())
         return layout
@@ -745,11 +1162,13 @@ class HitRateUI:
 # ============================================================
 
 def _print_headless_status(session: LiveHitRateSession, analyzer: HitRateAnalyzer) -> None:
-    """Compact one-line status for --no-ui mode."""
-    avg_us, p50_us, p99_us = session.latency_stats()
-    total_evaluated = analyzer.predictions_evaluated
+    """Compact multi-line status for --no-ui mode: live verdict + horizon stats."""
+    _, p50_us, p99_us = session.latency_stats()
 
-    # Overall hit rate across all state×horizon buckets
+    # LIVE snapshot — right now
+    verdict = analyzer.live_monitor.live_verdict()
+
+    # Statistical (horizon-based) aggregate
     stats = analyzer.snapshot_state_horizon()
     total_hits = sum(b.hits for b in stats.values())
     total_count = sum(b.count for b in stats.values())
@@ -757,15 +1176,33 @@ def _print_headless_status(session: LiveHitRateSession, analyzer: HitRateAnalyze
     hit_pct = (total_hits / total_count * 100) if total_count else 0
     net_pct = (total_net_prof / total_count * 100) if total_count else 0
 
-    print(f"  ticks={session.total_ticks_received:,} "
-          f"({session.ticks_per_second():.0f}/s) "
-          f"signals={session.total_signals_computed:,} "
-          f"pending={analyzer.pending_count()} "
-          f"evaluated={total_evaluated:,}  |  "
-          f"hit_rate={hit_pct:.1f}% "
-          f"net_profit_rate={net_pct:.1f}%  |  "
-          f"latency p50={p50_us:.0f}µs p99={p99_us:.0f}µs",
-          flush=True)
+    ts = datetime.now(IST).strftime("%H:%M:%S")
+    print(
+        f"[{ts} IST]  "
+        f"ticks={session.total_ticks_received:,} ({session.ticks_per_second():.0f}/s)  "
+        f"signals={session.total_signals_computed:,}  "
+        f"⚡LIVE: {verdict['total_open']} open ({verdict['winning']}✓/{verdict['losing']}✗ "
+        f"= {verdict['hit_rate_pct']:.0f}% hit_now, avg={verdict['avg_current_return_pct']:+.2f}%)  "
+        f"| Historic: {total_count:,} evaluated, hit={hit_pct:.1f}%, net_prof={net_pct:.1f}%  "
+        f"| lat p50/p99={p50_us:.0f}/{p99_us:.0f}µs",
+        flush=True,
+    )
+
+    # Show top 5 currently-open signals with real-time status
+    open_signals = analyzer.live_monitor.snapshot_open(top_n=5)
+    if open_signals:
+        cost_pct = analyzer.cost * 100
+        print("           Top open signals RIGHT NOW:")
+        for sig in open_signals:
+            dir_pct = sig.current_directional_return * 100
+            age_s = int(sig.seconds_elapsed)
+            status = "✓" if dir_pct > cost_pct else "~" if dir_pct > 0 else "✗"
+            print(f"             {status} {sig.symbol:<14} {sig.state:<12} "
+                  f"score={sig.smoothed_score:+.1f}  age={age_s:>3}s  "
+                  f"entry={sig.price_at_signal:>8.2f} → now={sig.current_price:>8.2f}  "
+                  f"dir_ret={dir_pct:+.3f}%  "
+                  f"MFE={sig.max_favorable_excursion*100:+.2f}% "
+                  f"MAE={sig.max_adverse_excursion*100:+.2f}%")
 
 
 def generate_eod_report(session: LiveHitRateSession, analyzer: HitRateAnalyzer) -> str:
@@ -906,6 +1343,40 @@ def generate_eod_report(session: LiveHitRateSession, analyzer: HitRateAnalyzer) 
         lines.append(f"  {hour:02d}:00-{hour:02d}:59 {b.count:>6,} "
                      f"{b.hit_rate*100:>7.1f}% {b.avg_return*100:>+9.3f}% "
                      f"{b.avg_net_edge*100:>+10.3f}% {verdict:<20}")
+
+    # MFE/MAE excursion statistics (for TP/SL calibration)
+    lines.append("")
+    lines.append("─" * W)
+    lines.append("  📈 MFE / MAE EXCURSION STATS (per state, from closed signals)")
+    lines.append("─" * W)
+    lines.append("  MFE = Max Favorable Excursion (best point signal was proved right)")
+    lines.append("  MAE = Max Adverse Excursion  (worst point signal was proved wrong)")
+    lines.append("  Use these to calibrate Take-Profit and Stop-Loss levels.")
+    lines.append("")
+    exc_stats = analyzer.live_monitor.excursion_stats()
+    if exc_stats:
+        lines.append(f"  {'State':<14} {'N':>6} {'Avg MFE %':>11} {'Med MFE %':>11} "
+                     f"{'Avg MAE %':>11} {'Med MAE %':>11} {'t→MFE (s)':>10} "
+                     f"{'Final Ret %':>13}")
+        lines.append("  " + "-" * (W - 2))
+        for state in ["STRONG_LONG", "LONG", "WEAK_LONG",
+                      "WEAK_SHORT", "SHORT", "STRONG_SHORT"]:
+            s = exc_stats.get(state)
+            if s is None:
+                continue
+            lines.append(
+                f"  {state:<14} {s['n']:>6} "
+                f"{s['avg_mfe_pct']:>+10.3f}% {s['median_mfe_pct']:>+10.3f}% "
+                f"{s['avg_mae_pct']:>+10.3f}% {s['median_mae_pct']:>+10.3f}% "
+                f"{s['avg_time_to_mfe_s']:>9.1f} "
+                f"{s['avg_final_return_pct']:>+12.3f}%"
+            )
+        lines.append("")
+        lines.append("  💡 Calibration hint:")
+        lines.append("     - Set TAKE_PROFIT ≈ median MFE (most trades reach it before decay)")
+        lines.append("     - Set STOP_LOSS  ≈ median MAE × 0.7 (avoid stopping out too early)")
+    else:
+        lines.append("  (No closed signals yet — need signals to reach max horizon)")
 
     # Top 10 symbols by predictive accuracy
     lines.append("")

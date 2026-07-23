@@ -269,14 +269,44 @@ regime-adaptive value.
 
 ## 📊 Live Hit Rate Analyzer (`live_hit_rate_analyzer.py`)
 
-**यह focused standalone tool है जो सिर्फ hit rate measure करने के लिए बना है।**
+**Real-time scanner + horizon-based statistical validator in one tool.**
 No trade simulation, no capital tracking — pure predictive accuracy measurement.
 
-### What It Does
+### Two-Layer Tracking
 
-Every actionable signal fire पर current LTP capture, फिर **6 horizons** पर check:
-5s / 15s / 30s / 60s / 120s / 300s। हर horizon पर देखे कि signal-direction में
-price actually moved या नहीं।
+**1. Real-Time Layer** — Every tick, every open signal:
+- Current directional return (positive = signal is proving RIGHT NOW)
+- MFE (Max Favorable Excursion) — best moment during signal life
+- MAE (Max Adverse Excursion) — worst moment during signal life
+- Live verdict: "X open / Y winning / Z losing right now"
+
+**2. Statistical Layer** — At each configured horizon:
+- Multi-dimensional bucketed hit rate (state × horizon × evidence × regime × hour × symbol)
+- Cost-adjusted net edge
+- Honest verdict per bucket
+
+### What The UI Shows
+
+```
+╭─ ⚡ LIVE VERDICT (open signals): 24 open → 15 winning / 8 losing ─╮
+│  Hit rate now: 62.5%  |  Avg current: +0.043%  |  Evaluated: 342 │
+╰──────────────────────────────────────────────────────────────────╯
+
+⚡ LIVE OPEN SIGNALS — Real-time score verdict
+┏━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━┓
+┃ Symbol     ┃ State     ┃ Age ┃ Entry ┃ Now    ┃ Dir Ret┃ MFE    ┃ Status     ┃
+┡━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━┩
+│ RELIANCE-EQ│ STRONG_LONG│ 12s │ 2530.15│ 2534.22│+0.161% │+0.180% │✓✓ PROFITABLE│
+│ HDFCBANK-EQ│ LONG      │ 45s │ 3327.41│ 3325.02│-0.072% │+0.045% │✗ losing     │
+│ ...        │ ...       │ ... │ ...    │ ...    │...     │ ...    │ ...         │
+```
+
+**यह जवाब देता है:** "अभी scanner सही जा रहा है या गलत? Market हमारे हिसाब से चल रही है या नहीं?"
+
+### Multi-Horizon Statistical Analysis
+
+Every actionable signal fire पर 6 horizons पर pending records बनते हैं:
+5s / 15s / 30s / 60s / 120s / 300s। हर horizon expire होने पर actual price check।
 
 ### Multi-Dimensional Breakdown
 
