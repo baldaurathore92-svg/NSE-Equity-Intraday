@@ -52,41 +52,41 @@ source venv/bin/activate
 # --- Define 10 strategies ---
 declare -a STRATEGY_NAMES=(
     "01_baseline"
-    "02_aggressive"
-    "03_conservative"
-    "04_regime_adaptive"
-    "05_ultra_strict"
+    "02_strong_only"
+    "03_ultra_strong"
+    "04_time_stop_15s"
+    "05_strong_time_stop"
     "06_tight_SL"
     "07_wide_SL"
     "08_quick_TP"
     "09_long_hold"
-    "10_best_of_best"
+    "10_gemini_sniper"
 )
 
 declare -a STRATEGY_FLAGS=(
     ""
-    "--entry-score 3.5 --entry-evidence 25"
-    "--entry-score 5.0 --entry-evidence 40"
-    "--regime-adaptive"
-    "--entry-score 5.0 --regime-adaptive"
+    "--strong-only"
+    "--strong-only --entry-score 5.0"
+    "--time-stop-sec 15 --time-stop-min-favor-pct 0.0005"
+    "--strong-only --time-stop-sec 15 --time-stop-min-favor-pct 0.0005"
     "--stop-loss-pct 0.0020"
     "--stop-loss-pct 0.0050"
     "--take-profit-pct 0.0030"
     "--max-hold-sec 600"
-    "--entry-score 5.0 --entry-evidence 40 --regime-adaptive --stop-loss-pct 0.0025 --take-profit-pct 0.0060"
+    "--strong-only --entry-score 5.0 --time-stop-sec 15 --time-stop-min-favor-pct 0.0010 --stop-loss-pct 0.0025 --take-profit-pct 0.0060 --regime-adaptive"
 )
 
 declare -a STRATEGY_DESCRIPTIONS=(
-    "Baseline (default settings)"
-    "Aggressive (score>=3.5, evid>=25)"
-    "Conservative (score>=5.0, evid>=40)"
-    "Regime-adaptive filter"
-    "Ultra strict + regime"
+    "Baseline (default)"
+    "STRONG only (skip WEAK+LONG/SHORT)"
+    "STRONG + score>=5.0 (extreme)"
+    "Time-stop 15s @ 0.05% favor"
+    "STRONG + time-stop 15s"
     "Tight stop-loss (0.20%)"
     "Wide stop-loss (0.50%)"
     "Quick take-profit (0.30%)"
     "Long hold time (10 min)"
-    "Best of Best combo"
+    "Gemini Sniper (all filters)"
 )
 
 # --- Run each strategy ---

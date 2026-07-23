@@ -587,6 +587,13 @@ class PaperExecutor:
         stop_loss_pct: float = 0.0030,        # 0.30%
         take_profit_pct: float = 0.0080,      # 0.80% (favorable R:R = 2.67)
         max_hold_seconds: float = 300.0,      # 5 min
+        # -- TIME STOP (Gemini's suggestion — scalp exit) --
+        # After time_stop_seconds elapsed, if trade hasn't moved
+        # time_stop_min_favor_pct% in our favor, EXIT immediately.
+        # 0 = disabled. Recommended: 15s / 0.05% favor.
+        # (Kills losers fast — cost saver in noise trades.)
+        time_stop_seconds: float = 0.0,
+        time_stop_min_favor_pct: float = 0.0005,   # 0.05% required favor
         trades_log_path: str = "logs/paper_trades.jsonl",
         equity_log_path: str = "logs/paper_equity.csv",
         # ---- Phase 2 regime-adaptive parameters ----
@@ -608,6 +615,10 @@ class PaperExecutor:
         self.stop_loss_pct = stop_loss_pct
         self.take_profit_pct = take_profit_pct
         self.max_hold = max_hold_seconds
+        # Time stop settings (0 = disabled)
+        self.time_stop_seconds = float(time_stop_seconds)
+        self.time_stop_min_favor_pct = float(time_stop_min_favor_pct)
+        self.time_stop_exits: int = 0     # counter for reporting
 
         # Phase 2 regime tuning
         self.regime_adaptive = regime_adaptive
@@ -869,7 +880,7 @@ class PaperExecutor:
         self.next_trade_id += 1
 
     def on_tick(self, symbol: str, ltp: float, ts: float) -> None:
-        """Check open position for stop-loss / take-profit / max-hold exit."""
+        """Check open position for stop-loss / take-profit / time-stop / max-hold exit."""
         pos = self.positions.get(symbol)
         if pos is None:
             return
@@ -889,6 +900,24 @@ class PaperExecutor:
             if ltp <= pos.take_profit_price:
                 self._close_position(symbol, ltp, ts, "take_profit")
                 return
+
+        # -- TIME STOP (early scalp exit) --
+        # Gemini's suggestion: if within N seconds the trade hasn't
+        # moved X% in our favor, exit. This kills lingering losers before
+        # they hit full SL, reducing avg loss size.
+        if self.time_stop_seconds > 0:
+            age = ts - pos.entry_ts
+            if age >= self.time_stop_seconds:
+                # Compute current directional return (signed: + means favor)
+                if pos.side == "LONG":
+                    favor_pct = (ltp - pos.entry_price) / pos.entry_price
+                else:
+                    favor_pct = (pos.entry_price - ltp) / pos.entry_price
+
+                if favor_pct < self.time_stop_min_favor_pct:
+                    self.time_stop_exits += 1
+                    self._close_position(symbol, ltp, ts, "time_stop")
+                    return
 
         # Max hold time
         if ts >= pos.max_hold_ts:
@@ -1229,6 +1258,10 @@ def generate_report(session: PaperTradingSession) -> str:
                     else "custom"))
     lines.append(f"  Blocked by state filter               : {ex.entries_blocked_by_state_filter:>7,}"
                  f"  (filter: {_sf})")
+    if ex.time_stop_seconds > 0:
+        lines.append(f"  Time-stop exits                       : {ex.time_stop_exits:>7,}"
+                     f"  (@ {ex.time_stop_seconds:.0f}s, "
+                     f"min favor {ex.time_stop_min_favor_pct*100:.3f}%)")
     if ex.rvol_calculator is not None:
         lines.append(f"  Entries allowed during RVOL warmup    : {ex.entries_allowed_during_rvol_warmup:>7,}")
     lines.append(f"  Executed trades (round-trip complete) : {n_trades:>7,}")
@@ -1502,6 +1535,18 @@ Examples:
     p.add_argument("--skip-weak", action="store_true",
                    help="Trade STRONG + LONG/SHORT (skip only WEAK).")
 
+    # -- Time stop (scalp exit) --
+    p.add_argument("--time-stop-sec", type=float, default=0.0,
+                   help="Time stop in seconds (default 0 = disabled). "
+                        "If trade hasn't moved --time-stop-min-favor%% in "
+                        "our favor by this time, exit immediately. "
+                        "Recommended: 15-30s (kills lingering losers, "
+                        "'alpha decay' protection).")
+    p.add_argument("--time-stop-min-favor-pct", type=float, default=0.0005,
+                   help="Minimum favorable move %% required to skip time "
+                        "stop (default 0.0005 = 0.05%%). Below this at time "
+                        "stop trigger → exit immediately.")
+
     # -- Signal quality gates (OPTIONAL — all default to disabled) --
     p.add_argument("--session-filter", action="store_true",
                    help="Enable NSE session phase filter. Block entries "
@@ -1603,6 +1648,13 @@ Examples:
     elif args.skip_weak:
         session.executor.allowed_signal_states = set(_NORMAL_AND_STRONG_STATES)
         logger.info(f"  State filter   : STRONG + LONG/SHORT (WEAK skipped)")
+
+    # -- Time stop (alpha decay killer) --
+    if args.time_stop_sec > 0:
+        session.executor.time_stop_seconds = args.time_stop_sec
+        session.executor.time_stop_min_favor_pct = args.time_stop_min_favor_pct
+        logger.info(f"  Time stop      : {args.time_stop_sec:.0f}s "
+                    f"(exit if favor < {args.time_stop_min_favor_pct*100:.3f}%)")
 
     # -- Attach optional signal-quality gates to executor --
     if args.session_filter:

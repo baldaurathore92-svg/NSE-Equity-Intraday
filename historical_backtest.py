@@ -60,6 +60,7 @@ from nse_book_scanner import (
     BookDynamicsEngine, DepthLevel, EngineConfig,
     MarketSnapshot, SignalResult, SignalState,
     _LONG_STATES, _SHORT_STATES, _ACTIONABLE_STATES,
+    _STRONG_STATES, _NORMAL_AND_STRONG_STATES,
 )
 from paper_trader import (
     PaperExecutor, Position, ClosedTrade,
@@ -212,6 +213,14 @@ class HistoricalBacktester:
         entry_score_threshold: float = 4.0,
         entry_min_evidence: float = 30.0,
         regime_adaptive: bool = False,
+        # Exit params (pass-through to PaperExecutor)
+        stop_loss_pct: float = 0.0030,
+        take_profit_pct: float = 0.0080,
+        max_hold_seconds: float = 300.0,
+        time_stop_seconds: float = 0.0,
+        time_stop_min_favor_pct: float = 0.0005,
+        # Signal state filter
+        allowed_signal_states: Optional[set] = None,
         trades_log_path: str = "logs/backtest_trades.jsonl",
         equity_log_path: str = "logs/backtest_equity.csv",
         progress_every_ticks: int = 100_000,
@@ -227,10 +236,18 @@ class HistoricalBacktester:
             capital=capital,
             entry_score_threshold=entry_score_threshold,
             entry_min_evidence=entry_min_evidence,
+            stop_loss_pct=stop_loss_pct,
+            take_profit_pct=take_profit_pct,
+            max_hold_seconds=max_hold_seconds,
+            time_stop_seconds=time_stop_seconds,
+            time_stop_min_favor_pct=time_stop_min_favor_pct,
             regime_adaptive=regime_adaptive,
             trades_log_path=trades_log_path,
             equity_log_path=equity_log_path,
         )
+        # Apply state filter after construction
+        if allowed_signal_states is not None:
+            self.executor.allowed_signal_states = set(allowed_signal_states)
 
         # Stats
         self.signal_counts: Dict[str, int] = defaultdict(int)
@@ -446,6 +463,27 @@ Compare configurations:
     p.add_argument("--regime-adaptive", action="store_true",
                    help="Enable Phase 2 regime-adaptive signal filtering")
 
+    # -- Exit params (pass-through to PaperExecutor) --
+    p.add_argument("--stop-loss-pct", type=float, default=0.0030,
+                   help="Stop-loss %% (default 0.0030 = 0.30%%)")
+    p.add_argument("--take-profit-pct", type=float, default=0.0080,
+                   help="Take-profit %% (default 0.0080 = 0.80%%)")
+    p.add_argument("--max-hold-sec", type=float, default=300.0,
+                   help="Max hold seconds (default 300 = 5 min)")
+    p.add_argument("--time-stop-sec", type=float, default=0.0,
+                   help="Time stop seconds — exit if favor < min-favor %% "
+                        "after N seconds (default 0 = disabled). "
+                        "Recommended 15-30s for scalp strategies.")
+    p.add_argument("--time-stop-min-favor-pct", type=float, default=0.0005,
+                   help="Min favorable move %% to skip time stop "
+                        "(default 0.0005 = 0.05%%)")
+
+    # -- State filter --
+    p.add_argument("--strong-only", action="store_true",
+                   help="Trade ONLY STRONG_LONG + STRONG_SHORT")
+    p.add_argument("--skip-weak", action="store_true",
+                   help="Trade STRONG + LONG/SHORT (skip WEAK)")
+
     p.add_argument("--trades-log", default="logs/backtest_trades.jsonl",
                    help="Path for trade audit log (default: logs/backtest_trades.jsonl)")
     p.add_argument("--equity-log", default="logs/backtest_equity.csv",
@@ -503,12 +541,31 @@ def main() -> int:
     logger.info(f"  Starting capital: ₹ {args.capital:,.0f}")
     logger.info("═" * 78)
 
+    # Determine allowed signal states from CLI
+    allowed_states = None
+    if args.strong_only:
+        allowed_states = set(_STRONG_STATES)
+        logger.info(f"  State filter    : STRONG_LONG + STRONG_SHORT only")
+    elif args.skip_weak:
+        allowed_states = set(_NORMAL_AND_STRONG_STATES)
+        logger.info(f"  State filter    : STRONG + LONG/SHORT (WEAK skipped)")
+
+    if args.time_stop_sec > 0:
+        logger.info(f"  Time stop       : {args.time_stop_sec:.0f}s "
+                    f"(exit if favor < {args.time_stop_min_favor_pct*100:.3f}%)")
+
     # Build backtester
     backtester = HistoricalBacktester(
         reader=reader,
         capital=args.capital,
         entry_score_threshold=args.entry_score,
         entry_min_evidence=args.entry_evidence,
+        stop_loss_pct=args.stop_loss_pct,
+        take_profit_pct=args.take_profit_pct,
+        max_hold_seconds=args.max_hold_sec,
+        time_stop_seconds=args.time_stop_sec,
+        time_stop_min_favor_pct=args.time_stop_min_favor_pct,
+        allowed_signal_states=allowed_states,
         regime_adaptive=args.regime_adaptive,
         trades_log_path=args.trades_log,
         equity_log_path=args.equity_log,
