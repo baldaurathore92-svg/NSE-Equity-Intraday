@@ -5748,6 +5748,19 @@ def generate_eod_report(session: LiveHitRateSession, analyzer: HitRateAnalyzer) 
     lines.append(f"    NetEdge %   = average per-trade return AFTER cost (BOTTOM LINE)")
     lines.append(f"    → +ve NetEdge = profitable | -ve NetEdge = loss-making")
     lines.append("")
+    lines.append(f"  ⚠  IMPORTANT INTERPRETATION NOTES:")
+    lines.append(f"     (1) Each horizon is an INDEPENDENT evaluation of the same signal.")
+    lines.append(f"         One signal produces 6 predictions (5s/15s/30s/60s/120s/300s),")
+    lines.append(f"         each scored against the executable price AT THAT MOMENT.")
+    lines.append(f"     (2) Different horizons legitimately produce DIFFERENT outcomes:")
+    lines.append(f"         5s: spread cost usually dominates → mostly losses")
+    lines.append(f"         300s: signal had time to develop → more wins")
+    lines.append(f"         Seeing 0% at 5s and 100% at 300s is EXPECTED, not a bug.")
+    lines.append(f"     (3) Verdict column says '⚠ need N more' when count < {analyzer.min_samples}.")
+    lines.append(f"         DO NOT trust hit rates below that threshold — pure noise.")
+    lines.append(f"     (4) TRUST the 60s+ horizons the most. 5s/15s are heavily")
+    lines.append(f"         spread-dominated; 300s+ can be regime-affected.")
+    lines.append("")
     stats_sh = analyzer.snapshot_state_horizon()
     lines.append(f"  {'State':<14} {'Horizon':>8} {'N':>7} {'Hit %':>8} "
                  f"{'%AboveCost':>13} {'AvgRet %':>10} {'NetEdge %':>11} {'Verdict':<20}")
@@ -5763,7 +5776,11 @@ def generate_eod_report(session: LiveHitRateSession, analyzer: HitRateAnalyzer) 
             avg = b.avg_return * 100
             edge = b.avg_net_edge * 100
             verdict, _ = analyzer.verdict(b)
-            lines.append(f"  {state:<14} {int(h):>6}s  {b.count:>6,} "
+            # Prefix low-sample rows with ⚠ so 100%/0% extremes from tiny
+            # samples don't look like real signal. Cell text otherwise
+            # unchanged — verdict column already says 'need N more'.
+            low_sample_prefix = "⚠" if b.count < analyzer.min_samples else " "
+            lines.append(f"  {low_sample_prefix} {state:<12} {int(h):>6}s  {b.count:>6,} "
                          f"{hit:>7.1f}% {netp:>12.1f}% {avg:>+9.3f}% "
                          f"{edge:>+10.3f}% {verdict:<20}")
 
