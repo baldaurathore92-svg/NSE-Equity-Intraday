@@ -23,12 +23,19 @@ cd NSE-Equity-Intraday
 # 2. सब कुछ install + Angel One credentials भरो (nano खुलेगा) + engine test
 bash SETUP.sh --setup-only
 
-# 3. Live analyzer चलाओ — 15-second sniper policy default में लगी हुई
+# 3a. Live analyzer — LOOSE mode (हर actionable signal record — recommended for first-day baseline)
+bash SETUP.sh --full
+
+# 3b. Live analyzer — SNIPER mode (opt-in via explicit flags)
 bash SETUP.sh --full -- --strong-only \
-    --entry-confirmation-sec 15 \
-    --survival-check-sec 15 \
-    --survival-min-favor-pct 0.0001
+    --entry-confirmation-sec 15 --entry-score 4.0 --entry-evidence 30 \
+    --survival-check-sec 15 --survival-min-favor-pct 0.0001
 ```
+
+⚠ **Default is LOOSE.** The 15-second sniper rules (`--entry-confirmation-sec` /
+`--survival-check-sec`) default to 0 (OFF) so a plain `bash SETUP.sh` records
+every actionable signal. Enable sniper only after 1-2 days of loose baseline
+data — see `bash SETUP.sh --help`.
 
 **Zero-config credential test (no broker needed):**
 ```bash
@@ -112,7 +119,7 @@ t=15s  : score अभी भी ≥ 4.0 → CONFIRMED → record signal
 cancel + rearm। Same-side re-arming के लिए पहले state को leave zone करना ज़रूरी।
 
 **Flags:**
-- `--entry-confirmation-sec 15` (0 से disable)
+- `--entry-confirmation-sec 15` — enable (default **0 = OFF**)
 - `--entry-score 4.0` (calibrated STRONG threshold — 67k live signals पर
   empirically tested; पुराने 8.0 default में STRONG_LONG कभी fire ही नहीं होता)
 - `--entry-evidence 30` (feature agreement × |score| × 10)
@@ -133,7 +140,7 @@ Survival check @ t=15s:
 ```
 
 **Flags:**
-- `--survival-check-sec 15` (0 से disable)
+- `--survival-check-sec 15` — enable (default **0 = OFF**)
 - `--survival-min-favor-pct 0.0001` (= 0.01%)
 
 ### Two-Table Reporting
