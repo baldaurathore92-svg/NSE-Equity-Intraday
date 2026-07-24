@@ -142,8 +142,7 @@ CANDIDATES=(
 
 CODE_DIR=""
 for candidate in "${CANDIDATES[@]}"; do
-    if [ -f "$candidate/live_hit_rate_analyzer.py" ] && \
-       [ -f "$candidate/nse_book_scanner.py" ]; then
+    if [ -f "$candidate/live_hit_rate_analyzer.py" ]; then
         CODE_DIR="$candidate"
         ok "Found code at: $CODE_DIR"
         break

@@ -163,7 +163,7 @@ fi
 cd "$REPO_DIR"
 
 # Verify files
-for f in live_hit_rate_analyzer.py nse_book_scanner.py config.example.json; do
+for f in live_hit_rate_analyzer.py config.example.json; do
     if [ ! -f "$REPO_DIR/$f" ]; then
         err "$f missing after clone/pull"
         exit 4
