@@ -462,171 +462,307 @@ class RegimeState:
 
 class RegimeDetector:
     """
-    Cheap, per-symbol regime classifier that runs alongside BookDynamicsEngine
-    on every tick.
+    Per-symbol regime classifier — FULLY TIME-BASED (post user-scan-4 rewrite).
 
-    Performance requirements (this runs 500-3000 times per second across
-    100 symbols on a 1-core VPS):
-      * Called on every tick, but heavy statistics only recomputed every
-        `update_every_n_ticks` (default 100 ticks ≈ once per 3-20 seconds
-        per symbol depending on activity).
-      * Uses fixed-size deques for O(1) append and bounded memory.
-      * Total memory: ~5000 floats × 100 symbols ≈ 4 MB — negligible.
+    ⚠ ARCHITECTURE (rewritten Nov 2026):
+        The old design used tick-count deques (500 recent ticks + 5000
+        baseline ticks) which had a severe scale mismatch:
+            * At market open (~50 tps): 500 ticks = 10 seconds
+            * At lunch (~1 tps): 500 ticks = 8 minutes
+        So the "recent volatility" window was measuring completely
+        different market regimes depending on tick rate.
 
-    All thresholds are tunable, but the defaults were calibrated against
-    Nifty stock behaviour: a lag-1 autocorrelation > +0.10 is a plausible
-    trending signature, < -0.08 is mean reversion, and vol ratios below 0.7
-    or above 1.5 reliably mark calm / stormy regimes respectively.
+        We also no longer use lag-1 tick-return autocorrelation. On NSE
+        cash, bid-ask bounce makes consecutive LTPs alternate between
+        best-bid and best-ask, producing a spuriously negative
+        autocorrelation (-0.20 to -0.50) even in obviously trending
+        markets. That signal was a mathematical artifact.
+
+        And Lee-Ready aggressor tick rule (buyer_aggressor_ratio) is NOT
+        consumed here either — its ~65-75% accuracy on NSE cash makes it
+        a noise source, not a signal.
+
+    NEW DESIGN:
+        Every metric is aggregated over FIXED TIME WINDOWS using
+        TimeSeriesBuffer, not tick counts. Only order-book derived
+        signals feed the classifier:
+
+           * L1 imbalance                (near-book quality)
+           * Full book (top-5) imbalance (deeper flow)
+           * Bid addition rate           (new buy interest)
+           * Ask addition rate           (new sell interest)
+           * Bid removal rate            (buy withdrawals)
+           * Ask removal rate            (sell withdrawals)
+           * Spread expansion / CoV      (volatility proxy)
+           * Mid-price movement direction (trend confirmation)
+
+        Classification uses persistence of book-imbalance sign + mid-price
+        direction over the window. Volatility uses spread coefficient of
+        variation. All windows are fixed wall-clock time — lunch-hour
+        slowness no longer stretches the baseline.
     """
 
     def __init__(
         self,
-        update_every_n_ticks: int = 100,
-        recent_window: int = 500,          # ~last few minutes at 5 tps
-        baseline_window: int = 5000,       # much longer reference window
-        vol_high_threshold: float = 1.5,   # recent σ / baseline σ upper cutoff
-        vol_low_threshold: float = 0.7,    # recent σ / baseline σ lower cutoff
-        autocorr_trending_threshold: float = 0.10,
-        autocorr_reverting_threshold: float = -0.08,
+        # Warm-up: return non-confident state for the first N seconds so
+        # the buffers can fill with real market data.
+        warmup_seconds: float = 30.0,
+        # Recompute cadence: don't do the O(N) statistics on every tick,
+        # only every this-many seconds (250 ms default).
+        recompute_interval_s: float = 0.25,
+        # All feature buffers use this time window.
+        window_seconds: float = 5.0,
+        # Depth bias: |mean(book_imbalance)| above this = one-sided book.
         depth_bias_threshold: float = 0.15,
+        # Volatility thresholds via spread coefficient of variation
+        # (spread stdev / spread mean).
+        vol_high_cov: float = 0.50,
+        vol_low_cov:  float = 0.15,
+        # Minimum mid-price move over the window (in bps) to consider
+        # the market "directional" as opposed to noise.
+        trend_direction_bps: float = 5.0,
+        # Fraction of book-imbalance samples that must share the sign of
+        # their mean for the classifier to call it "persistent".
+        persistence_threshold: float = 0.65,
     ):
         # Configuration
-        self.update_every = update_every_n_ticks
-        self.vol_high = vol_high_threshold
-        self.vol_low = vol_low_threshold
-        self.trend_up = autocorr_trending_threshold
-        self.trend_down = autocorr_reverting_threshold
-        self.depth_bias_thr = depth_bias_threshold
+        self.warmup_seconds       = float(warmup_seconds)
+        self.recompute_interval_s = float(recompute_interval_s)
+        self.window_seconds       = float(window_seconds)
+        self.depth_bias_thr       = float(depth_bias_threshold)
+        self.vol_high_cov         = float(vol_high_cov)
+        self.vol_low_cov          = float(vol_low_cov)
+        self.trend_dir_bps        = float(trend_direction_bps)
+        self.persistence_thr      = float(persistence_threshold)
 
-        # Rolling buffers — fixed-size deques so old data drops automatically.
-        self.recent_returns:    Deque[float] = deque(maxlen=recent_window)
-        self.baseline_returns:  Deque[float] = deque(maxlen=baseline_window)
-        self.recent_imbalances: Deque[float] = deque(maxlen=recent_window)
+        # One time-based buffer per feature — TimeSeriesBuffer handles
+        # append + trim automatically. Same window length for all metrics.
+        w = self.window_seconds
+        self._l1_imb    = TimeSeriesBuffer(w)
+        self._book_imb  = TimeSeriesBuffer(w)
+        self._bid_add   = TimeSeriesBuffer(w)
+        self._ask_add   = TimeSeriesBuffer(w)
+        self._bid_rem   = TimeSeriesBuffer(w)
+        self._ask_rem   = TimeSeriesBuffer(w)
+        self._spread    = TimeSeriesBuffer(w)
+        self._mid_price = TimeSeriesBuffer(w)
 
         # State machine
-        self.last_price:  Optional[float] = None
-        self.tick_count:  int = 0
-        self.ticks_since_update: int = 0
+        self._start_ts: Optional[float] = None
+        self._last_recompute_ts: float = -1.0
         self.current_regime = RegimeState()
 
-    def update(self, ltp: float, book_wide_imbalance: float) -> RegimeState:
+    def update(
+        self,
+        ts: float,
+        l1_imbalance: float,
+        book_wide_imbalance: float,
+        bid_added: int,
+        ask_added: int,
+        bid_removed: int,
+        ask_removed: int,
+        spread_bps: float,
+        mid_price: Optional[float],
+    ) -> RegimeState:
         """
-        Called by BookDynamicsEngine on every tick. Very cheap — just
-        appends to rolling buffers and periodically triggers a batched
-        recompute of the classification.
+        Called by BookDynamicsEngine on every tick.
 
-        Returns the CURRENT regime state (may be stale by up to
-        `update_every_n_ticks` ticks if a recompute hasn't happened yet;
-        this staleness is intentional to keep the per-tick cost bounded).
+        Appends the eight order-book-derived features into their
+        respective time-based buffers, and — at most once every
+        `recompute_interval_s` seconds — recomputes the RegimeState.
+        Every metric is derived from the ORDER BOOK, none from LTP
+        return sequences or the tick-rule aggressor.
+
+        Returns the current RegimeState. May be stale by up to
+        recompute_interval_s (default 250 ms) so heavy stats don't
+        run on the hot WebSocket thread every tick.
         """
-        # Compute per-tick return whenever we have a previous price.
-        # Skips the very first tick, and defensively any zero/negative price.
-        if self.last_price is not None and self.last_price > 0:
-            ret = (ltp - self.last_price) / self.last_price
-            self.recent_returns.append(ret)
-            self.baseline_returns.append(ret)
-        self.last_price = ltp
-        self.recent_imbalances.append(book_wide_imbalance)
+        if self._start_ts is None:
+            self._start_ts = ts
 
-        # Batched heavy-compute cadence: only run the O(N) statistics
-        # (std / autocorr) once per `update_every` ticks. Called on the
-        # WS worker thread — we cannot afford per-tick work here.
-        self.tick_count += 1
-        self.ticks_since_update += 1
-        if self.ticks_since_update >= self.update_every:
-            self.ticks_since_update = 0
-            self._recompute()
+        # Append to all buffers — TimeSeriesBuffer batches the trim so
+        # per-append cost is O(1) amortized.
+        self._l1_imb.append(ts, float(l1_imbalance))
+        self._book_imb.append(ts, float(book_wide_imbalance))
+        self._bid_add.append(ts, float(bid_added))
+        self._ask_add.append(ts, float(ask_added))
+        self._bid_rem.append(ts, float(bid_removed))
+        self._ask_rem.append(ts, float(ask_removed))
+        self._spread.append(ts, float(spread_bps))
+        if mid_price is not None and mid_price > 0:
+            self._mid_price.append(ts, float(mid_price))
+
+        # Recompute at fixed wall-clock cadence, not per-tick.
+        if ts - self._last_recompute_ts < self.recompute_interval_s:
+            return self.current_regime
+        self._last_recompute_ts = ts
+
+        # Warm-up: not-confident until enough time has elapsed.
+        elapsed = ts - self._start_ts
+        if elapsed < self.warmup_seconds:
+            return self.current_regime  # still default RegimeState()
+
+        self._recompute()
         return self.current_regime
 
     def _recompute(self) -> None:
         """
-        Batched heavy compute — runs once per `update_every` ticks. Reads
-        the rolling buffers and produces a fresh RegimeState. Guarded so
-        it silently no-ops until we have at least 50 recent samples (the
-        very first minute of trading each day).
+        Recompute the RegimeState from the current contents of the
+        time-based buffers.
+
+        All statistics are over the FULL wall-clock window (default 5s).
+        Sub-window analysis (250 ms / 1 s / 3 s) can be added later by
+        slicing self._X.values() at bisect points.
         """
-        if len(self.recent_returns) < 50:
+        mid_vals   = self._mid_price.values()
+        book_vals  = self._book_imb.values()
+        spread_vals = self._spread.values()
+
+        # Need enough samples in each buffer for stats to be meaningful.
+        # (In warmed-up state we expect ~25 samples for a 5s window at
+        # 5 tps; require 5 minimum to survive a very slow start.)
+        if len(mid_vals) < 5 or len(book_vals) < 5:
             return
 
-        # ---- Volatility regime ----
-        # Compare recent σ to a much longer baseline σ. If we don't yet
-        # have a proper baseline (< 500 samples) we treat vol as NORMAL
-        # by making the ratio ≈ 1.0.
-        recent_std = self._std(self.recent_returns)
-        baseline_std = (self._std(self.baseline_returns)
-                        if len(self.baseline_returns) >= 500 else recent_std)
-        vol_ratio = recent_std / max(baseline_std, 1e-9)
-        if vol_ratio > self.vol_high:
-            vol_regime = "HIGH"
-        elif vol_ratio < self.vol_low:
-            vol_regime = "LOW"
+        # ---- 1. Mid-price direction over the full window ----
+        # First vs last mid tells us the net direction; expressed in bps
+        # so the trend_dir_bps threshold is scale-invariant.
+        mid_first = mid_vals[0]
+        mid_last  = mid_vals[-1]
+        if mid_first > 0:
+            mid_move_bps = (mid_last - mid_first) / mid_first * 10000.0
         else:
-            vol_regime = "NORMAL"
-
-        # ---- Trend regime via lag-1 autocorrelation of tick returns ----
-        # Positive autocorr = returns cluster in the same direction = trend.
-        # Negative autocorr = returns alternate = mean reversion.
-        # We disambiguate up-vs-down trend using the sign of the mean.
-        autocorr = self._autocorr_lag1(self.recent_returns)
-        mean_return = sum(self.recent_returns) / len(self.recent_returns)
-        if autocorr > self.trend_up:
-            trend_regime = "TRENDING_UP" if mean_return > 0 else "TRENDING_DOWN"
-        elif autocorr < self.trend_down:
-            trend_regime = "MEAN_REVERTING"
+            mid_move_bps = 0.0
+        if mid_move_bps > self.trend_dir_bps:
+            mid_direction = 1
+        elif mid_move_bps < -self.trend_dir_bps:
+            mid_direction = -1
         else:
-            trend_regime = "RANDOM"
+            mid_direction = 0
 
-        # ---- Depth bias ----
-        # Rolling mean of the book-wide imbalance (buy qty vs sell qty).
-        # Structural imbalance persisting for many ticks implies genuine
-        # one-sided flow (not just noise).
-        depth_mean = sum(self.recent_imbalances) / len(self.recent_imbalances)
-        if depth_mean > self.depth_bias_thr:
-            depth_regime = "BULL_STRUCTURAL"
-        elif depth_mean < -self.depth_bias_thr:
-            depth_regime = "BEAR_STRUCTURAL"
+        # ---- 2. Book-imbalance persistence ----
+        # Mean imbalance sign + fraction of samples with that sign.
+        # High persistence + non-trivial magnitude = one-sided flow.
+        book_mean = sum(book_vals) / len(book_vals)
+        if abs(book_mean) < 1e-9:
+            persistence = 0.5   # neutral
         else:
-            depth_regime = "BALANCED"
+            same_sign_count = sum(
+                1 for v in book_vals
+                if (v > 0 and book_mean > 0) or (v < 0 and book_mean < 0)
+            )
+            persistence = same_sign_count / len(book_vals)
 
-        # `is_confident` becomes True once we have a proper baseline σ
-        # (500+ samples ≈ several minutes of live ticks per symbol). Until
-        # then downstream code should treat regime as "unknown".
+        # ---- 2b. Explicit sign-flip rate for mean-reversion detection ----
+        # `persistence` collapses to 0.5 when book_mean is exactly zero
+        # (perfect flip pattern). Count actual sign changes as an independent
+        # signal — but ONLY count "meaningful" flips where the value is well
+        # above the noise floor. Otherwise tiny random noise around 0
+        # generates a high flip rate that mimics real mean-reversion.
+        _noise_floor = self.depth_bias_thr * 0.5   # 50% of bias threshold
+        sign_changes = 0
+        counted_pairs = 0
+        prev_sign = 0
+        for v in book_vals:
+            if abs(v) < _noise_floor:
+                # value too small to count as a real "side" — reset chain
+                prev_sign = 0
+                continue
+            s = 1 if v > 0 else -1
+            if prev_sign != 0:
+                counted_pairs += 1
+                if s != prev_sign:
+                    sign_changes += 1
+            prev_sign = s
+        flip_rate = sign_changes / counted_pairs if counted_pairs > 0 else 0.0
+
+        # ---- 3. Add / remove asymmetry (order-book flow direction) ----
+        # Net bid pressure = bid additions - bid removals (positive = buying).
+        # Net ask pressure = ask removals - ask additions (positive = buying).
+        # Sum of both gives the FLOW direction from the order book itself,
+        # independent of the aggressor tick rule.
+        bid_add_sum = sum(self._bid_add.values())
+        bid_rem_sum = sum(self._bid_rem.values())
+        ask_add_sum = sum(self._ask_add.values())
+        ask_rem_sum = sum(self._ask_rem.values())
+        net_flow = (bid_add_sum - bid_rem_sum) + (ask_rem_sum - ask_add_sum)
+        total_flow = (bid_add_sum + bid_rem_sum +
+                      ask_add_sum + ask_rem_sum)
+        flow_bias = safe_div(net_flow, max(total_flow, 1.0))
+
+        # ---- 4. Spread coefficient of variation ----
+        # Stdev(spread) / mean(spread) — dimensionless, comparable across
+        # symbols of any price. High CoV = volatile spread = HIGH regime.
+        spread_mean = sum(spread_vals) / len(spread_vals) if spread_vals else 0.0
+        if spread_mean > 0 and len(spread_vals) >= 2:
+            spread_var = sum((v - spread_mean) ** 2 for v in spread_vals) / len(spread_vals)
+            spread_cov = (spread_var ** 0.5) / spread_mean
+        else:
+            spread_cov = 0.0
+
+        # Mean absolute imbalance — magnitude gate for MEAN_REVERTING
+        # classification. A market with weak, noisy imbalance around 0 is
+        # genuinely RANDOM, even if the noise happens to flip signs a lot.
+        # Only classify as MEAN_REVERTING when imbalance has REAL magnitude.
+        book_mean_abs = sum(abs(v) for v in book_vals) / len(book_vals)
+
+        # ---- Classification ----
+        # Priority order:
+        #   1. TRENDING when mid-price + book agree strongly.
+        #   2. MEAN_REVERTING when book imbalance is BOTH strong (in
+        #      magnitude) AND flipping (in sign / persistence).
+        #   3. RANDOM otherwise (includes low-magnitude noise).
+        _MEAN_REV_FLIP_RATE = 0.40   # >40% of consecutive book samples flip
+
+        if (mid_direction != 0
+                and persistence >= self.persistence_thr
+                and abs(book_mean) >= self.depth_bias_thr):
+            if mid_direction > 0 and book_mean > 0:
+                trend = "TRENDING_UP"
+            elif mid_direction < 0 and book_mean < 0:
+                trend = "TRENDING_DOWN"
+            else:
+                trend = "MEAN_REVERTING"   # mid moving one way, book other
+        elif (book_mean_abs >= self.depth_bias_thr
+              and (flip_rate >= _MEAN_REV_FLIP_RATE
+                   or persistence < (1.0 - self.persistence_thr))):
+            trend = "MEAN_REVERTING"       # strong magnitude AND flipping
+        else:
+            trend = "RANDOM"
+
+        # VOLATILITY via spread CoV
+        if spread_cov > self.vol_high_cov:
+            volatility = "HIGH"
+        elif spread_cov < self.vol_low_cov:
+            volatility = "LOW"
+        else:
+            volatility = "NORMAL"
+
+        # DEPTH BIAS: sign + magnitude of book imbalance mean.
+        if book_mean > self.depth_bias_thr:
+            depth_bias = "BULL_STRUCTURAL"
+        elif book_mean < -self.depth_bias_thr:
+            depth_bias = "BEAR_STRUCTURAL"
+        else:
+            depth_bias = "BALANCED"
+
+        # Confidence: >= warmup_seconds elapsed AND enough buffer samples.
+        # No tick-count check needed because we're purely time-driven now.
+        is_confident = len(book_vals) >= 20
+
+        # Populate RegimeState. autocorr_lag1 stays for JSONL schema
+        # backwards-compat but is now always 0.0 (feature deprecated).
+        # volatility_ratio field is repurposed to carry spread CoV so
+        # downstream diagnostics still have a scalar to display.
         self.current_regime = RegimeState(
-            volatility=vol_regime, trend=trend_regime, depth_bias=depth_regime,
-            volatility_ratio=vol_ratio, autocorr_lag1=autocorr,
-            depth_imbalance_mean=depth_mean,
-            is_confident=(len(self.baseline_returns) >= 500),
+            volatility=volatility,
+            trend=trend,
+            depth_bias=depth_bias,
+            volatility_ratio=spread_cov,
+            autocorr_lag1=0.0,   # deprecated — reserved for future use
+            depth_imbalance_mean=book_mean,
+            is_confident=is_confident,
         )
-
-    # -- Numerical helpers (pure functions, no state) --
-
-    @staticmethod
-    def _std(values) -> float:
-        """Population standard deviation (biased). Returns 0.0 for n < 2."""
-        n = len(values)
-        if n < 2:
-            return 0.0
-        mean = sum(values) / n
-        var = sum((x - mean) ** 2 for x in values) / n
-        return var ** 0.5
-
-    @staticmethod
-    def _autocorr_lag1(values) -> float:
-        """
-        Pearson lag-1 autocorrelation coefficient of a sequence.
-        Range [-1, +1]. Returns 0.0 for n < 3 or a degenerate (zero-variance)
-        series (avoiding a divide-by-zero when the market is completely flat).
-        """
-        vals = list(values)
-        n = len(vals)
-        if n < 3:
-            return 0.0
-        mean = sum(vals) / n
-        den = sum((x - mean) ** 2 for x in vals)
-        if den < 1e-18:
-            return 0.0
-        num = sum((vals[i] - mean) * (vals[i-1] - mean) for i in range(1, n))
-        return num / den
 
 
 @dataclass
@@ -979,7 +1115,15 @@ class EngineConfig:
     w_book_wide_imbalance: float = 1.0
     w_imbalance_roc:       float = 2.5   # leading indicator — highest weight
     w_liquidity_flow:      float = 1.5
-    w_aggressor_ratio:     float = 2.0
+    # -- Lee-Ready aggressor tick rule (weight defaults to 0.0) --
+    # The tick-rule inference of buyer- vs seller-initiated trades from
+    # LTP vs prior mid is only ~65-75% accurate on NSE cash, and the
+    # ~25-35% error rate flows directly into composite score sign errors.
+    # Per user directive (Nov 2026): zero this weight so no downstream
+    # signal, regime detection, or decision logic consumes it. The metric
+    # is still COMPUTED and stored in BookMetrics for audit / diagnostics
+    # comparison, but does not contribute to trading decisions.
+    w_aggressor_ratio:     float = 0.0
     w_mid_response:        float = 1.5
     # -- Iceberg (previously computed but ignored by composite) --
     # Default 0.0 preserves backwards compat. Real refills-with-executions
@@ -1502,8 +1646,22 @@ class BookDynamicsEngine:
             m.kill_switch_active = True
             m.kill_switch_reason = "Lower circuit hit"
 
-        # ---- Phase 2 — Regime detection (per-tick update, batched recompute) ----
-        m.regime = self._regime_detector.update(snap.ltp, m.book_wide_imbalance)
+        # ---- Phase 2 — Regime detection (per-tick update, batched recompute)
+        # Time-based classifier. Feeds ORDER-BOOK ONLY features:
+        # L1 + full-book imbalance, add/remove rates, spread, mid-price.
+        # Deliberately does NOT consume tick-return sequences or the
+        # Lee-Ready aggressor (both are noise-dominated on NSE cash).
+        m.regime = self._regime_detector.update(
+            ts=snap.timestamp,
+            l1_imbalance=m.l1_imbalance,
+            book_wide_imbalance=m.book_wide_imbalance,
+            bid_added=m.buy_added,
+            ask_added=m.sell_added,
+            bid_removed=m.buy_removed,
+            ask_removed=m.sell_removed,
+            spread_bps=m.normalized_spread_bps,
+            mid_price=snap.mid_price,
+        )
 
         return m
 
