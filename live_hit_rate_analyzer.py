@@ -985,6 +985,25 @@ class EngineConfig:
     threshold_normal: float = 3.0
     threshold_weak:   float = 2.0
 
+    # ==============================================================
+    # -- Regime gate (added after user's Hindi feedback exposing that
+    #    RegimeState.is_tradeable() and .should_invert_signal() were
+    #    only referenced in the diagnostics dict, never in the actual
+    #    signal-generation path). --
+    # ==============================================================
+    # When True, signals fired while regime.is_tradeable() is False
+    # (RANDOM regime OR still-warming-up regime detector) are DEMOTED
+    # to NEUTRAL. This prevents the "trading noise as signal" failure
+    # mode where every WEAK signal gets recorded regardless of whether
+    # the market is even in a trend-ish regime.
+    #
+    # Default False for backwards compat — existing users' hit-rate
+    # numbers don't change unless they opt in. Enable via CLI:
+    #     --regime-gate            (drops signals in RANDOM regime)
+    #     --regime-invert          (flips signal direction in MEAN_REVERTING)
+    regime_gate_enabled:            bool = False
+    regime_invert_mean_reverting:   bool = False
+
 
 # ---------------------------------------------------------------------------
 # 5. BookDynamicsEngine — the analytical core
@@ -1823,6 +1842,36 @@ class BookDynamicsEngine:
             self._ema_score = a * raw_score + (1.0 - a) * self._ema_score
         smoothed = self._ema_score
 
+        # =====================================================
+        # REGIME GATE (opt-in via EngineConfig.regime_gate_enabled) --
+        # Two independent operations, applied BEFORE state mapping so
+        # every downstream field (state, reasons, evidence) reflects
+        # the gate's decision:
+        #
+        #   (a) regime_invert_mean_reverting:
+        #       If regime is confidently MEAN_REVERTING, flip score sign
+        #       so a bullish orderbook signal is treated as SHORT (i.e.,
+        #       the crowd's LONG conviction is now the contrarian entry).
+        #
+        #   (b) regime_gate_enabled:
+        #       If regime is not tradeable (RANDOM or not-yet-confident),
+        #       clamp score to 0 so state → NEUTRAL. This addresses the
+        #       "trading noise as signal" failure mode.
+        # =====================================================
+        regime_note: Optional[str] = None
+        if cfg.regime_invert_mean_reverting and m.regime.should_invert_signal():
+            smoothed = -smoothed
+            regime_note = f"Signal inverted (regime={m.regime.label})"
+        if cfg.regime_gate_enabled and not m.regime.is_tradeable():
+            # Force NEUTRAL by zeroing the smoothed score. We KEEP
+            # the diagnostics untouched so a curious user can see WHY
+            # the signal was suppressed via the regime fields.
+            smoothed = 0.0
+            regime_note = (
+                f"Regime gate: {m.regime.label} not tradeable "
+                f"(confident={m.regime.is_confident}, trend={m.regime.trend})"
+            )
+
         # State mapping
         state = self._score_to_state(smoothed)
 
@@ -1831,6 +1880,8 @@ class BookDynamicsEngine:
         evidence = clamp(abs(smoothed) * (0.5 + 0.5 * agreement) * 10.0, 0.0, 100.0)
 
         reasons = self._compose_reasons(m, weighted, smoothed, agreement)
+        if regime_note is not None:
+            reasons.insert(0, regime_note)
 
         return SignalResult(
             timestamp=snap.timestamp,
@@ -6562,6 +6613,31 @@ Examples:
                         "(0.6 = tighter tracking, but more noise). "
                         "Lower = smoother but delayed (0.15 = very stable).")
 
+    # -- Regime-aware gates (opt-in — default OFF for backwards compat) --
+    # यह flags उस user feedback के response में हैं जिसमें कहा गया कि
+    # regime.is_tradeable() केवल diagnostics में use हो रही थी, actual gate
+    # में नहीं। दोनों flags allow करते हैं user को empirically test करने
+    # कि उनके market पर regime-aware trading edge देती है या नहीं।
+    p.add_argument("--regime-gate", action="store_true",
+                   help="Drop signals fired while regime is RANDOM or still "
+                        "warming up. Sets state=NEUTRAL when "
+                        "regime.is_tradeable() is False. Default: OFF "
+                        "(records every signal regardless of regime).")
+    p.add_argument("--regime-invert", action="store_true",
+                   help="Flip signal direction (LONG↔SHORT) when regime is "
+                        "confidently MEAN_REVERTING. Contrarian mode for "
+                        "range-bound markets. Default: OFF.")
+
+    # -- Engine tunables (previously hardcoded in EngineConfig) --
+    p.add_argument("--spoof-dampener-strength", type=float, default=None,
+                   help="How aggressively spoof suspicion reduces conviction "
+                        "(default: 0.5). Set to 0.0 to disable and test if "
+                        "spoof detector is producing false positives.")
+    p.add_argument("--kill-switch-spread-mult", type=float, default=None,
+                   help="Kill-switch triggers when spread exceeds median × N "
+                        "(default: 3.0). Set 2.0 for tighter fast-market "
+                        "protection.")
+
     # -- Signal state filter (which states to record) --
     p.add_argument("--strong-only", action="store_true",
                    help="Record ONLY STRONG_LONG + STRONG_SHORT signals. "
@@ -6807,6 +6883,19 @@ def main() -> int:
         threshold_overrides.append(f"weak={args.weak_threshold}")
     if args.ema_alpha is not None:
         engine_config.ema_alpha = args.ema_alpha
+    # Wire new engine tunables from CLI (opt-in fixes for user feedback)
+    if args.regime_gate:
+        engine_config.regime_gate_enabled = True
+        threshold_overrides.append("regime_gate=ON")
+    if args.regime_invert:
+        engine_config.regime_invert_mean_reverting = True
+        threshold_overrides.append("regime_invert=ON")
+    if args.spoof_dampener_strength is not None:
+        engine_config.spoof_dampener_strength = args.spoof_dampener_strength
+        threshold_overrides.append(f"spoof_dampener={args.spoof_dampener_strength}")
+    if args.kill_switch_spread_mult is not None:
+        engine_config.kill_switch_spread_multiplier = args.kill_switch_spread_mult
+        threshold_overrides.append(f"kill_switch_mult={args.kill_switch_spread_mult}")
         threshold_overrides.append(f"ema_alpha={args.ema_alpha}")
 
     logger.info(f"  Score thresholds: STRONG≥{engine_config.threshold_strong}, "
@@ -6822,8 +6911,16 @@ def main() -> int:
     print("=" * 72)
     print("  🎛️  ACTIVE FILTERS")
     print("=" * 72)
-    print(f"  State filter        : "
-          f"{'STRONG only' if args.strong_only else 'STRONG + LONG/SHORT (skip WEAK)' if args.skip_weak else 'ALL actionable (incl. WEAK)'}")
+    # User's live-data analysis (Nov 2026): default 'all actionable' fired
+    # 16,101 signals in one hour (~4.5/sec) — 100% flood dominated by WEAK.
+    # We keep the default (backwards compat) but shout at the operator so
+    # nobody trades on WEAK signals without deliberately opting in.
+    _state_filter_label = (
+        "STRONG only" if args.strong_only
+        else "STRONG + LONG/SHORT (skip WEAK)" if args.skip_weak
+        else "⚠  ALL actionable (incl. WEAK — HIGH NOISE, consider --skip-weak)"
+    )
+    print(f"  State filter        : {_state_filter_label}")
     print(f"  Entry confirmation  : "
           f"{'ON — score must hold ≥ ' + str(args.entry_score) + ' for ' + str(int(args.entry_confirmation_sec)) + 's continuously' if args.entry_confirmation_sec > 0 else 'OFF (signals recorded on first fire)'}")
     print(f"  Survival exit       : "
@@ -6832,6 +6929,13 @@ def main() -> int:
           f"{'ON (' + args.allowed_phases + ')' if args.session_filter else 'OFF (LUNCH / PRE_CLOSE not skipped)'}")
     print(f"  RVOL gate           : "
           f"{'ON — min ' + str(args.min_rvol) + '× ' + str(args.rvol_window_minutes) + '-min avg' if args.min_rvol > 0 else 'OFF (no volume filter)'}")
+    print(f"  Regime gate         : "
+          f"{'ON — signals demoted to NEUTRAL when regime is RANDOM/warming' if args.regime_gate else 'OFF (regime is diagnostic-only)'}")
+    print(f"  Regime invert       : "
+          f"{'ON — LONG↔SHORT flipped in confirmed MEAN_REVERTING' if args.regime_invert else 'OFF'}")
+    print(f"  Spoof dampener      : "
+          f"{'DISABLED (0.0)' if engine_config.spoof_dampener_strength == 0.0 else f'{engine_config.spoof_dampener_strength:.2f} conviction reduction'}")
+    print(f"  Kill-switch spread  : {engine_config.kill_switch_spread_multiplier:.1f}× 30-sec median")
     print(f"  Stale-feed guard    : "
           f"{'ON — exit 75 after ' + str(int(args.stale_feed_sec)) + 's silence in market hours' if args.stale_feed_sec > 0 else 'OFF'}")
     print(f"  Cost model          : "

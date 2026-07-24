@@ -843,6 +843,18 @@ class EngineConfig:
     threshold_normal: float = 3.0
     threshold_weak:   float = 2.0
 
+    # ==============================================================
+    # -- Regime gate (added after user feedback exposing that
+    #    RegimeState.is_tradeable() and .should_invert_signal() were
+    #    only referenced in the diagnostics dict, never in the actual
+    #    signal-generation path). --
+    # ==============================================================
+    # When True, signals fired while regime.is_tradeable() is False
+    # (RANDOM regime OR still-warming-up regime detector) are DEMOTED
+    # to NEUTRAL. Default False for backwards compat.
+    regime_gate_enabled:            bool = False
+    regime_invert_mean_reverting:   bool = False
+
 
 # ---------------------------------------------------------------------------
 # 5. BookDynamicsEngine — the analytical core
@@ -1681,6 +1693,26 @@ class BookDynamicsEngine:
             self._ema_score = a * raw_score + (1.0 - a) * self._ema_score
         smoothed = self._ema_score
 
+        # =====================================================
+        # REGIME GATE (opt-in via EngineConfig.regime_gate_enabled).
+        # Two operations applied BEFORE state mapping so every field
+        # (state, reasons, evidence) reflects the gate's decision:
+        #   (a) regime_invert_mean_reverting: flip score sign in a
+        #       confirmed MEAN_REVERTING regime (contrarian entry).
+        #   (b) regime_gate_enabled: clamp score to 0 when regime is
+        #       not tradeable (RANDOM or not-yet-confident).
+        # =====================================================
+        regime_note: Optional[str] = None
+        if cfg.regime_invert_mean_reverting and m.regime.should_invert_signal():
+            smoothed = -smoothed
+            regime_note = f"Signal inverted (regime={m.regime.label})"
+        if cfg.regime_gate_enabled and not m.regime.is_tradeable():
+            smoothed = 0.0
+            regime_note = (
+                f"Regime gate: {m.regime.label} not tradeable "
+                f"(confident={m.regime.is_confident}, trend={m.regime.trend})"
+            )
+
         # State mapping
         state = self._score_to_state(smoothed)
 
@@ -1689,6 +1721,8 @@ class BookDynamicsEngine:
         evidence = clamp(abs(smoothed) * (0.5 + 0.5 * agreement) * 10.0, 0.0, 100.0)
 
         reasons = self._compose_reasons(m, weighted, smoothed, agreement)
+        if regime_note is not None:
+            reasons.insert(0, regime_note)
 
         return SignalResult(
             timestamp=snap.timestamp,
@@ -3685,6 +3719,22 @@ Examples:
     p.add_argument("--ema-alpha", type=float, default=None,
                    help="EMA smoothing factor for score (default: 0.3).")
 
+    # -- Regime gate (opt-in) --
+    p.add_argument("--regime-gate", action="store_true",
+                   help="Drop signals when regime is RANDOM or still warming up "
+                        "(sets state=NEUTRAL). Default: OFF.")
+    p.add_argument("--regime-invert", action="store_true",
+                   help="Flip LONG↔SHORT in confirmed MEAN_REVERTING regime. "
+                        "Contrarian mode. Default: OFF.")
+
+    # -- Engine tunables (previously hardcoded) --
+    p.add_argument("--spoof-dampener-strength", type=float, default=None,
+                   help="Spoof suspicion conviction reduction (default: 0.5). "
+                        "Set 0.0 to disable and test false-positive rate.")
+    p.add_argument("--kill-switch-spread-mult", type=float, default=None,
+                   help="Kill-switch trigger = median × N (default: 3.0). "
+                        "Try 2.0 for tighter fast-market protection.")
+
     # -- Signal state filter --
     p.add_argument("--strong-only", action="store_true",
                    help="Print ONLY STRONG_LONG + STRONG_SHORT signals.")
@@ -3817,6 +3867,21 @@ def main() -> int:
     if args.normal_threshold is not None: engine_config.threshold_normal = args.normal_threshold
     if args.weak_threshold  is not None:  engine_config.threshold_weak  = args.weak_threshold
     if args.ema_alpha       is not None:  engine_config.ema_alpha       = args.ema_alpha
+    # -- Regime gate wiring (opt-in) --
+    if args.regime_gate:
+        engine_config.regime_gate_enabled = True
+        logger.info("  Regime gate     : ENABLED (signals demoted when RANDOM/warming)")
+    if args.regime_invert:
+        engine_config.regime_invert_mean_reverting = True
+        logger.info("  Regime invert   : ENABLED (LONG↔SHORT in MEAN_REVERTING)")
+    # -- Spoof + kill-switch tunables --
+    if args.spoof_dampener_strength is not None:
+        engine_config.spoof_dampener_strength = args.spoof_dampener_strength
+        logger.info(f"  Spoof dampener  : {args.spoof_dampener_strength:.2f}"
+                    + (" (DISABLED)" if args.spoof_dampener_strength == 0.0 else ""))
+    if args.kill_switch_spread_mult is not None:
+        engine_config.kill_switch_spread_multiplier = args.kill_switch_spread_mult
+        logger.info(f"  Kill-switch mult: {args.kill_switch_spread_mult:.1f}× median spread")
 
     # Determine allowed state set
     if args.strong_only:
@@ -3827,7 +3892,15 @@ def main() -> int:
         logger.info(f"  State filter    : STRONG + LONG/SHORT (WEAK skipped)")
     else:
         allowed_states = set(_ACTIONABLE_STATES)
-        logger.info(f"  State filter    : all actionable")
+        # User's live-data analysis showed WEAK signals dominate at ~4.5/sec
+        # and drag hit-rate near zero. Warn loudly if operator is running
+        # with the noisy default.
+        logger.warning("═" * 72)
+        logger.warning("  ⚠  STATE FILTER: ALL actionable (includes WEAK — HIGH NOISE)")
+        logger.warning("     WEAK signals dominate signal volume (~90%+ of firings)")
+        logger.warning("     and typically show <10 %% hit rate at 5s horizons.")
+        logger.warning("     Recommendation: run with --skip-weak or --strong-only")
+        logger.warning("═" * 72)
 
     # Build optional gates
     session_manager: Optional[SessionStateManager] = None
