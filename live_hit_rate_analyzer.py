@@ -5493,7 +5493,16 @@ class HitRateUI:
 # ============================================================
 
 def _print_headless_status(session: LiveHitRateSession, analyzer: HitRateAnalyzer) -> None:
-    """Compact multi-line status for --no-ui mode: live verdict + horizon stats."""
+    """
+    Compact multi-line status for --no-ui mode.
+
+    Prints on every heartbeat (default every 10s):
+      1. One-line header — ticks / signals-computed / signals-recorded
+      2. Live verdict — open/winning/losing snapshot
+      3. Compact table of latest 5 open signals (state / age / dir return / MFE)
+      4. Signal-state distribution running counts
+      5. Filter block counters if any gate is active
+    """
     _, p50_us, p99_us = session.latency_stats()
 
     # LIVE snapshot — right now
@@ -5519,16 +5528,29 @@ def _print_headless_status(session: LiveHitRateSession, analyzer: HitRateAnalyze
         flush=True,
     )
 
-    # Show top 5 currently-open signals with real-time status
+    # -- Signal state distribution (running counts by state) --
+    # This tells the operator "engine is computing signals, here's the
+    # split by state" even when nothing is currently open.
+    counts = session.signal_state_counts
+    dist_bits: List[str] = []
+    for st in ("STRONG_LONG", "LONG", "WEAK_LONG",
+               "WEAK_SHORT", "SHORT", "STRONG_SHORT"):
+        c = counts.get(st, 0)
+        if c > 0:
+            dist_bits.append(f"{st}={c:,}")
+    if dist_bits:
+        print(f"           📡 State counts: {' · '.join(dist_bits)}")
+
+    # -- Currently-open signals (up to 5, most recent first) --
     open_signals = analyzer.live_monitor.snapshot_open(top_n=5)
     if open_signals:
         cost_pct = analyzer.cost * 100
-        print("           Top open signals RIGHT NOW:")
+        print("           ⚡ OPEN signals right now:")
         for sig in open_signals:
             dir_pct = sig.current_directional_return * 100
             age_s = int(sig.seconds_elapsed)
             status = "✓" if dir_pct > cost_pct else "~" if dir_pct > 0 else "✗"
-            # Sentinel-aware MFE/MAE display (matches rich UI behavior)
+            # Sentinel-aware MFE/MAE display (matches rich UI behaviour).
             mfe_str = ("      —" if sig.time_to_mfe_s < 0
                        else f"{sig.max_favorable_excursion*100:+.2f}%")
             mae_str = ("      —" if sig.time_to_mae_s < 0
@@ -5538,6 +5560,53 @@ def _print_headless_status(session: LiveHitRateSession, analyzer: HitRateAnalyze
                   f"entry={sig.price_at_signal:>8.2f} → now={sig.current_price:>8.2f}  "
                   f"dir_ret={dir_pct:+.3f}%  "
                   f"MFE={mfe_str} MAE={mae_str}")
+    else:
+        # No open signals — explain WHY so the operator isn't just staring
+        # at silence. Show what's active + any filter block counters.
+        why_bits: List[str] = []
+        if analyzer.entry_confirmation_seconds > 0:
+            pending = len(analyzer._pending_confirmations)
+            why_bits.append(
+                f"confirmation({analyzer.entry_confirmation_seconds:.0f}s,"
+                f"score≥{analyzer.entry_score_threshold or 0:.1f})"
+                f": pending={pending} cancelled={analyzer.confirmations_cancelled}"
+                f" passed={analyzer.confirmations_passed}"
+            )
+        if analyzer.allowed_signal_states != set(_ACTIONABLE_STATES):
+            filt = ("STRONG-only" if analyzer.allowed_signal_states == set(_STRONG_STATES)
+                    else "STRONG+LONG/SHORT" if analyzer.allowed_signal_states == set(_NORMAL_AND_STRONG_STATES)
+                    else "custom")
+            why_bits.append(f"state-filter({filt}): blocked={analyzer.signals_blocked_by_state_filter}")
+        if analyzer.session_manager is not None:
+            why_bits.append(f"session-gate: blocked={analyzer.signals_blocked_by_session}")
+        if analyzer.min_rvol > 0.0:
+            why_bits.append(f"rvol≥{analyzer.min_rvol}: blocked={analyzer.signals_blocked_by_low_rvol}")
+        if why_bits:
+            print(f"           ⏸ 0 open signals · {' · '.join(why_bits)}")
+        elif session.total_signals_computed == 0:
+            print(f"           ⏸ 0 signals computed yet — waiting for first tick"
+                  f" or engine warm-up")
+        else:
+            # Engine is producing signals but none are actionable — everything
+            # currently NEUTRAL / SUPPRESSED.
+            print(f"           ⏸ 0 open (score below thresholds; state mostly "
+                  f"{max(counts, key=counts.get) if counts else 'NEUTRAL'})")
+
+    # -- Recently CLOSED signals (last 3) — so operator sees the latest
+    # completed events without having to tail the JSONL log. --
+    with analyzer.live_monitor._lock:
+        recent = list(analyzer.live_monitor.recently_closed)
+    if recent:
+        latest = recent[-3:]
+        print(f"           🏁 Latest closed ({len(recent):,} total):")
+        for sig in reversed(latest):
+            outcome = ("✓✓ PROFIT" if sig.current_directional_return > analyzer.cost
+                       else "✓ WIN" if sig.current_directional_return > 0
+                       else "✗ LOSS")
+            print(f"             {outcome} {sig.symbol:<14} {sig.state:<12} "
+                  f"reason={sig.close_reason:<14} "
+                  f"final={sig.current_directional_return*100:+.3f}% "
+                  f"MFE={sig.max_favorable_excursion*100:+.2f}%")
 
 
 def generate_eod_report(session: LiveHitRateSession, analyzer: HitRateAnalyzer) -> str:
