@@ -822,6 +822,11 @@ class EngineConfig:
     # Shorten to 2.0 in slow markets to avoid stale-volume poisoning.
     aggressor_window_s:       float = 5.0
 
+    # If True (default), imbalance_roc_5s uses TOP-5 imbalance (only the
+    # levels we actually see). If False, uses broker's full-book aggregate
+    # (Levels 1..20+, susceptible to far-book fake-order poisoning).
+    imbalance_roc_use_top5:   bool = True
+
     # -- Iceberg detector --
     # An "iceberg" here means a level that keeps refilling to roughly the
     # same visible size after nearby executions — implying real hidden
@@ -1256,12 +1261,24 @@ class BookDynamicsEngine:
             elif T == 5.0:
                 m.buy_book_roc_5s  = buy_roc
                 m.sell_book_roc_5s = sell_roc
-                # Imbalance ROC (Δ imbalance, not % change)
-                past_imb = safe_div(
-                    ps.total_buy_qty - ps.total_sell_qty,
-                    ps.total_buy_qty + ps.total_sell_qty,
-                )
-                m.imbalance_roc_5s = m.book_wide_imbalance - past_imb
+                # Imbalance ROC: use TOP-5 imbalance by default (not the
+                # broker's full-book aggregate) so Level-10+ fake orders
+                # don't poison the highest-weighted feature.
+                # See EngineConfig.imbalance_roc_use_top5 for details.
+                if self.config.imbalance_roc_use_top5:
+                    ps_sum_bid = sum(b.quantity for b in ps.bids)
+                    ps_sum_ask = sum(a.quantity for a in ps.asks)
+                    past_imb = safe_div(
+                        ps_sum_bid - ps_sum_ask,
+                        ps_sum_bid + ps_sum_ask,
+                    )
+                    m.imbalance_roc_5s = m.top5_imbalance - past_imb
+                else:
+                    past_imb = safe_div(
+                        ps.total_buy_qty - ps.total_sell_qty,
+                        ps.total_buy_qty + ps.total_sell_qty,
+                    )
+                    m.imbalance_roc_5s = m.book_wide_imbalance - past_imb
                 # Spread ROC
                 if ps.spread and ps.spread > 0:
                     m.spread_roc_5s = safe_div(m.spread - ps.spread, ps.spread)
@@ -3833,6 +3850,18 @@ Examples:
     p.add_argument("--w-iceberg", type=float, default=None,
                    help="Weight for iceberg feature (default 0.0). "
                         "Try 1.0 to enable hidden-liquidity signal.")
+    p.add_argument("--w-top5-imbalance", type=float, default=None,
+                   help="Weight for top5_imbalance (default 1.5).")
+    p.add_argument("--w-weighted-depth", type=float, default=None,
+                   help="Weight for weighted_depth (default 2.0).")
+    p.add_argument("--w-mid-response", type=float, default=None,
+                   help="Weight for mid_price_roc (default 1.5, LAGGING).")
+    p.add_argument("--w-liquidity-flow", type=float, default=None,
+                   help="Weight for liquidity_flow (default 1.5).")
+    p.add_argument("--imbalance-roc-from-book-wide", action="store_true",
+                   help="Restore old imbalance_roc source (full book, "
+                        "susceptible to far-book fake-order poisoning). "
+                        "Default: top-5 based.")
     p.add_argument("--ema-warmup-ticks", type=int, default=None,
                    help="Suppress signals for first N ticks (default 50). "
                         "Fixes 9:15 AM Cold Start Trap.")
@@ -4004,6 +4033,21 @@ def main() -> int:
     if args.w_iceberg is not None:
         engine_config.w_iceberg = args.w_iceberg
         logger.info(f"  w_iceberg       : {args.w_iceberg:.2f}")
+    if args.w_top5_imbalance is not None:
+        engine_config.w_top5_imbalance = args.w_top5_imbalance
+        logger.info(f"  w_top5          : {args.w_top5_imbalance:.2f}")
+    if args.w_weighted_depth is not None:
+        engine_config.w_weighted_depth = args.w_weighted_depth
+        logger.info(f"  w_weighted_depth: {args.w_weighted_depth:.2f}")
+    if args.w_mid_response is not None:
+        engine_config.w_mid_response = args.w_mid_response
+        logger.info(f"  w_mid_response  : {args.w_mid_response:.2f}")
+    if args.w_liquidity_flow is not None:
+        engine_config.w_liquidity_flow = args.w_liquidity_flow
+        logger.info(f"  w_liquidity_flow: {args.w_liquidity_flow:.2f}")
+    if args.imbalance_roc_from_book_wide:
+        engine_config.imbalance_roc_use_top5 = False
+        logger.info("  imbalance_roc   : from full-book (legacy)")
     if args.ema_warmup_ticks is not None:
         engine_config.ema_warmup_ticks = args.ema_warmup_ticks
         logger.info(f"  EMA warmup      : {args.ema_warmup_ticks} ticks")

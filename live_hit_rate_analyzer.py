@@ -1068,6 +1068,14 @@ class EngineConfig:
     spoof_pull_threshold_pct: float = 0.4
     spoof_pull_window_s:      float = 1.5
 
+    # -- imbalance_roc source (user scan-6 finding) --
+    # Old design derived imbalance_roc_5s from book_wide_imbalance which
+    # uses BROKER-BROADCAST full-book aggregates (Levels 1..20+). A fake
+    # order at Level 10 could poison this feature. New default: derive
+    # imbalance_roc from top-5 imbalance instead, so only visible levels
+    # contribute. Set to False to restore old behaviour.
+    imbalance_roc_use_top5:   bool = True
+
     # -- Aggressor volume window (addressed scan-3 concern that a flat
     #    5-second sum over-weights stale volume in slow markets). --
     # Length of the rolling window over which buy-side vs sell-side
@@ -1557,11 +1565,33 @@ class BookDynamicsEngine:
                 m.buy_book_roc_5s  = buy_roc
                 m.sell_book_roc_5s = sell_roc
                 # Imbalance ROC (Δ imbalance, not % change)
-                past_imb = safe_div(
-                    ps.total_buy_qty - ps.total_sell_qty,
-                    ps.total_buy_qty + ps.total_sell_qty,
-                )
-                m.imbalance_roc_5s = m.book_wide_imbalance - past_imb
+                #
+                # ⚠ FIX (user scan-6 finding): the OLD formula used
+                # book_wide_imbalance derived from ps.total_buy_qty /
+                # ps.total_sell_qty. Those are BROKER-BROADCAST FULL-BOOK
+                # aggregates spanning Levels 1..20+. A fake order parked
+                # at Level 10 (which we can't even see in top-5) would
+                # spike total_buy_qty by tens of thousands of shares and
+                # poison the highest-weighted feature in the composite.
+                #
+                # We now compute imbalance_roc from the TOP-5 imbalance
+                # (which uses only the levels we actually receive). If
+                # the user wants the old behaviour they can flip the
+                # config field `imbalance_roc_use_top5 = False`.
+                if self.config.imbalance_roc_use_top5:
+                    ps_sum_bid = sum(b.quantity for b in ps.bids)
+                    ps_sum_ask = sum(a.quantity for a in ps.asks)
+                    past_imb = safe_div(
+                        ps_sum_bid - ps_sum_ask,
+                        ps_sum_bid + ps_sum_ask,
+                    )
+                    m.imbalance_roc_5s = m.top5_imbalance - past_imb
+                else:
+                    past_imb = safe_div(
+                        ps.total_buy_qty - ps.total_sell_qty,
+                        ps.total_buy_qty + ps.total_sell_qty,
+                    )
+                    m.imbalance_roc_5s = m.book_wide_imbalance - past_imb
                 # Spread ROC
                 if ps.spread and ps.spread > 0:
                     m.spread_roc_5s = safe_div(m.spread - ps.spread, ps.spread)
@@ -2833,6 +2863,8 @@ def load_config(path: str) -> ScannerConfig:
             "aggressor_window_s",
             # Iceberg detection window
             "iceberg_price_hold_bps",
+            # imbalance_roc source (top-5 vs full book)
+            "imbalance_roc_use_top5",
         ]:
             if fld in ec:
                 setattr(ecfg, fld, type(getattr(ecfg, fld))(ec[fld]))
@@ -6932,6 +6964,28 @@ Examples:
                    help="Weight for iceberg feature (default 0.0). Set 1.0 "
                         "to include hidden-liquidity signal in composite. "
                         "Previously dead code before this commit.")
+    p.add_argument("--w-top5-imbalance", type=float, default=None,
+                   help="Weight for top5_imbalance (default 1.5). Blind sum "
+                        "over 5 levels. Set 0 if you already have "
+                        "--w-weighted-depth doing distance-adjusted work.")
+    p.add_argument("--w-weighted-depth", type=float, default=None,
+                   help="Weight for weighted_depth_imbalance (default 2.0). "
+                        "Distance-decayed depth imbalance. Raise to 3.5 if "
+                        "you set --w-top5-imbalance 0 to compensate.")
+    p.add_argument("--w-mid-response", type=float, default=None,
+                   help="Weight for mid_price_roc_5s (default 1.5). This is "
+                        "a LAGGING feature — price moved so momentum "
+                        "confirmed. Set 0.0 to make the scanner purely "
+                        "leading. Set 0.2 for gentle momentum confirmation.")
+    p.add_argument("--w-liquidity-flow", type=float, default=None,
+                   help="Weight for liquidity_flow feature (default 1.5). "
+                        "Set 0 if you distrust broker's total_buy_qty / "
+                        "total_sell_qty aggregates.")
+    p.add_argument("--imbalance-roc-from-book-wide", action="store_true",
+                   help="Restore old behaviour: derive imbalance_roc_5s "
+                        "from broker's full-book aggregate (Levels 1..20+) "
+                        "instead of top-5 sum. Default is top-5, which "
+                        "avoids Level-10+ fake-order poisoning.")
 
     # -- EMA warm-up (Cold-Start Trap fix) --
     p.add_argument("--ema-warmup-ticks", type=int, default=None,
@@ -7230,6 +7284,21 @@ def main() -> int:
     if args.w_iceberg is not None:
         engine_config.w_iceberg = args.w_iceberg
         threshold_overrides.append(f"w_iceberg={args.w_iceberg}")
+    if args.w_top5_imbalance is not None:
+        engine_config.w_top5_imbalance = args.w_top5_imbalance
+        threshold_overrides.append(f"w_top5={args.w_top5_imbalance}")
+    if args.w_weighted_depth is not None:
+        engine_config.w_weighted_depth = args.w_weighted_depth
+        threshold_overrides.append(f"w_wdepth={args.w_weighted_depth}")
+    if args.w_mid_response is not None:
+        engine_config.w_mid_response = args.w_mid_response
+        threshold_overrides.append(f"w_mid={args.w_mid_response}")
+    if args.w_liquidity_flow is not None:
+        engine_config.w_liquidity_flow = args.w_liquidity_flow
+        threshold_overrides.append(f"w_flow={args.w_liquidity_flow}")
+    if args.imbalance_roc_from_book_wide:
+        engine_config.imbalance_roc_use_top5 = False
+        threshold_overrides.append("imbalance_roc=book_wide")
     if args.ema_warmup_ticks is not None:
         engine_config.ema_warmup_ticks = args.ema_warmup_ticks
         threshold_overrides.append(f"ema_warmup={args.ema_warmup_ticks}")
