@@ -6123,6 +6123,159 @@ def seconds_until_market_close() -> float:
 # 7. MAIN
 # ============================================================
 
+def _verify_horizons(path: str, limit: int = 20) -> int:
+    """
+    Post-hoc audit tool for the SAME question the user keeps asking:
+    "How can the SAME trade show 0% hit at 5s and 100% at 300s?"
+
+    Reads the JSONL prediction log written by HitRateAnalyzer._evaluate()
+    and groups predictions by (ts_fired, symbol, state) so all 6 horizon
+    evaluations of ONE signal sit on the same row. Then prints a table so
+    you can VERIFY the pattern in your own recorded data — no faith in
+    my math required.
+
+    Ranking: signals sorted by |return_at_max_horizon − return_at_min_horizon|
+    descending, so the ROWS THAT LOOK MOST SUSPICIOUS come first. If those
+    rows show a smooth monotone progression from spread-cost-loss to
+    trend-development-win, the "bug" is actually just real market physics.
+
+    Returns 0 on success (something to display), 2 on hard failure.
+    """
+    import json as _json  # local import; this function is CLI-invoked
+    from collections import defaultdict as _dd
+
+    p = Path(path)
+    if not p.exists():
+        print(f"\n❌ Log file not found: {path}", file=sys.stderr)
+        print(f"   Run the analyzer first: python3 live_hit_rate_analyzer.py "
+              f"--config config.json --duration-hours 0.5", file=sys.stderr)
+        return 2
+
+    # Group all 6-horizon rows for the same signal fire together.
+    # Key = (ts_fired_rounded_ms, symbol, state) — the same triple identifies
+    # a single scanner event that fanned out to 6 pending predictions.
+    grouped: Dict[Tuple[float, str, str], Dict[float, Dict]] = _dd(dict)
+    total_rows = 0
+    parse_errors = 0
+
+    with p.open("r", encoding="utf-8") as fh:
+        for line_no, raw in enumerate(fh, 1):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                rec = _json.loads(raw)
+            except (ValueError, TypeError):
+                parse_errors += 1
+                continue
+            ts_fired = rec.get("ts_fired")
+            symbol = rec.get("symbol")
+            state = rec.get("state")
+            horizon = rec.get("target_horizon_s")
+            if ts_fired is None or symbol is None or state is None or horizon is None:
+                parse_errors += 1
+                continue
+            key = (round(float(ts_fired), 3), str(symbol), str(state))
+            grouped[key][float(horizon)] = rec
+            total_rows += 1
+
+    if not grouped:
+        print(f"\n❌ No prediction rows parsed from {path}", file=sys.stderr)
+        print(f"   Parse errors: {parse_errors}", file=sys.stderr)
+        return 2
+
+    # Rank signals by DIVERGENCE across horizons: max(net_return) − min(net_return)
+    # This surfaces the exact rows the user is worried about.
+    def _divergence(hor_map: Dict[float, Dict]) -> float:
+        vals = [r.get("net_return_pct", 0.0) for r in hor_map.values()]
+        if len(vals) < 2:
+            return 0.0
+        return max(vals) - min(vals)
+
+    ranked = sorted(grouped.items(), key=lambda kv: -_divergence(kv[1]))
+
+    # Header
+    W = 118
+    print("═" * W)
+    print("  📊 PER-SIGNAL HORIZON BREAKDOWN (verify-horizons)")
+    print("═" * W)
+    print(f"  Log file           : {path}")
+    print(f"  Total rows parsed  : {total_rows:,}")
+    print(f"  Unique signals     : {len(grouped):,}  "
+          f"(each signal fans out to up-to-6 horizon rows)")
+    print(f"  Parse errors       : {parse_errors:,}")
+    print(f"  Showing top {min(limit, len(ranked))} signals by 5s-vs-300s divergence")
+    print("")
+    print("  Column meanings (per horizon row):")
+    print("    entry_ask/bid = executable entry price (LONG=ASK, SHORT=BID)")
+    print("    exit_bid/ask  = executable exit  price (LONG=BID, SHORT=ASK)")
+    print("    gross %       = directional return AT EXECUTABLE QUOTES (spread INCLUDED)")
+    print("    net %         = gross minus explicit charges (STT/GST/brokerage)")
+    print("    hit           = ✓ if gross > 0, ✗ otherwise")
+    print("")
+    print("  यदि एक ही signal (same row) पर 5s में hit=✗ और 300s में hit=✓ है, तो यह")
+    print("  proof है कि 0%/100% pattern REAL है — spread cost 5s पर हावी है, पर")
+    print("  300s तक price इतनी चली कि spread recover होकर profit दिखने लगा।")
+    print("─" * W)
+
+    shown = 0
+    for (ts_fired, symbol, state), hor_map in ranked:
+        if shown >= limit:
+            break
+        # Only interesting if the signal actually has ≥2 horizon rows.
+        if len(hor_map) < 2:
+            continue
+
+        # Signal header line — timestamp, symbol, state, entry side.
+        from datetime import datetime as _dt
+        try:
+            ts_str = _dt.fromtimestamp(ts_fired, tz=IST).strftime("%H:%M:%S.%f")[:-3]
+        except (ValueError, OSError, OverflowError):
+            ts_str = f"ts={ts_fired:.3f}"
+        # All 6 rows for the same signal share entry price/bid/ask.
+        first = next(iter(hor_map.values()))
+        entry_price = first.get("price_at_signal", 0.0)
+        entry_bid = first.get("bid_at_signal", 0.0)
+        entry_ask = first.get("ask_at_signal", 0.0)
+        spread_bps = first.get("spread_bps_at_signal", 0.0)
+
+        print("")
+        print(f"  🎯 Signal #{shown+1}: {ts_str} IST  {symbol:<14} state={state}")
+        print(f"     entry_price={entry_price:.4f}   entry_bid={entry_bid:.4f}   "
+              f"entry_ask={entry_ask:.4f}   spread={spread_bps:.2f} bps")
+        print(f"     {'Horizon':>10} {'ExitPrice':>12} {'ExitBid':>10} {'ExitAsk':>10} "
+              f"{'Gross %':>10} {'Charges %':>11} {'Net %':>10}  {'Hit':>5}")
+        print(f"     {'-'*90}")
+
+        # One line per horizon evaluated for this signal.
+        for h in sorted(hor_map.keys()):
+            r = hor_map[h]
+            gross = r.get("directional_return_pct", 0.0)
+            charges = r.get("charges_pct", 0.0)
+            net = r.get("net_return_pct", 0.0)
+            ex_price = r.get("price_at_horizon", 0.0)
+            ex_bid = r.get("bid_at_horizon", 0.0)
+            ex_ask = r.get("ask_at_horizon", 0.0)
+            hit_mark = "✓" if gross > 0 else "✗"
+            print(f"     {int(h):>9}s {ex_price:>12.4f} {ex_bid:>10.4f} {ex_ask:>10.4f} "
+                  f"{gross:>+9.4f}% {charges:>+10.4f}% {net:>+9.4f}%  {hit_mark:>5}")
+
+        # Divergence footnote — makes the row's suspiciousness quantitative.
+        div = _divergence(hor_map)
+        print(f"     divergence(max-min net %) = {div:+.4f}%")
+        shown += 1
+
+    print("")
+    print("─" * W)
+    print("  ✔ Verification tool complete. Every row above is REAL recorded data.")
+    print("     — If 5s shows ✗ and 300s shows ✓ for the SAME signal, that")
+    print("       is spread-cost-vs-time physics, not a code bug.")
+    print("     — If any two horizons of the SAME signal disagree by more than")
+    print("       what spread alone can explain, share this dump for review.")
+    print("═" * W)
+    return 0
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Live Hit Rate Analyzer — measure scanner's predictive "
@@ -6191,6 +6344,16 @@ Examples:
     p.add_argument("--engine-demo", action="store_true",
                    help="Run the 8-scenario BookDynamicsEngine self-test "
                         "(no config or network needed) and exit.")
+    p.add_argument("--verify-horizons", metavar="JSONL_PATH", default=None,
+                   help="Read a prediction audit log (logs/hit_rate_predictions.jsonl) "
+                        "and print per-signal 5s/15s/30s/60s/120s/300s breakdown. "
+                        "Use this to VERIFY that a single signal really does show "
+                        "LOSS at 5s and WIN at 300s in your recorded data. "
+                        "Example: --verify-horizons logs/hit_rate_predictions.jsonl "
+                        "(runs then exits without needing config/network).")
+    p.add_argument("--verify-limit", type=int, default=20,
+                   help="Max signals to print in --verify-horizons output "
+                        "(default: 20). Signals ranked by 5s-vs-300s divergence.")
     p.add_argument("--stale-feed-sec", type=float, default=90.0,
                    help="Exit with code 75 (for systemd auto-restart) if no "
                         "valid tick arrives for this many seconds during NSE "
@@ -6311,6 +6474,13 @@ def main() -> int:
         )
         _engine_demo()
         return 0
+
+    # Short-circuit: post-hoc per-signal horizon audit (reads JSONL log)
+    # Does NOT need config, credentials, or network — pure log analysis.
+    # Purpose: prove to a skeptical trader that ONE signal really does
+    # legitimately show LOSS at 5s and WIN at 300s in their own data.
+    if getattr(args, "verify_horizons", None):
+        return _verify_horizons(args.verify_horizons, args.verify_limit)
 
     # Load config
     try:
