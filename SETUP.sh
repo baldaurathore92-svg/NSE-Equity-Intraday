@@ -526,6 +526,7 @@ ExecStart=${REPO_DIR}/venv/bin/python3 ${REPO_DIR}/live_hit_rate_analyzer.py \\
     --entry-evidence 30 \\
     --survival-check-sec 15 \\
     --survival-min-favor-pct 0.0001 \\
+    --stale-feed-sec 90 \\
     --log-path ${LOG_DIR}/hit_rate_predictions.jsonl \\
     --report-path ${LOG_DIR}/hit_rate_report.txt
 

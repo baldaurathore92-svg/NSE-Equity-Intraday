@@ -2002,8 +2002,11 @@ class SessionPhase(Enum):
     HOLIDAY        = "HOLIDAY"            # user-configured trading holiday
 
 
-# NSE IST timezone (fixed, doesn't depend on system TZ setting)
-_IST = timezone(timedelta(hours=5, minutes=30))
+# The canonical NSE IST timezone constant used across the whole file.
+# It is defined once here and referenced as `IST` everywhere (previously we
+# had a duplicate `_IST` alias further up that could silently diverge from
+# `IST` if only one was changed — consolidated to a single source of truth).
+IST = timezone(timedelta(hours=5, minutes=30))
 
 # Default set of phases where signals are considered "tradeable"
 # (User can override via CLI / config)
@@ -2091,7 +2094,7 @@ class SessionStateManager:
         Return NSE phase for given Unix timestamp (UTC seconds).
         Thread-safe. Also updates internal transition stats.
         """
-        dt = datetime.fromtimestamp(ts, tz=_IST)
+        dt = datetime.fromtimestamp(ts, tz=IST)
         wd = dt.weekday()   # Monday=0 ... Sunday=6
 
         # -- Weekend --
@@ -2129,7 +2132,7 @@ class SessionStateManager:
             return False, f"phase={phase.value}"
 
         if enforce_no_new_entry_cutoff:
-            dt = datetime.fromtimestamp(ts, tz=_IST)
+            dt = datetime.fromtimestamp(ts, tz=IST)
             if dt.weekday() < 5 and dt.time() >= self.no_new_entry_after:
                 return False, f"after_no_entry_cutoff({self.no_new_entry_after})"
 
@@ -2140,7 +2143,7 @@ class SessionStateManager:
         Seconds remaining until market close (15:30 IST by default) on the
         current trading day. Returns 0.0 if market already closed.
         """
-        dt = datetime.fromtimestamp(ts, tz=_IST)
+        dt = datetime.fromtimestamp(ts, tz=IST)
         if dt.weekday() >= 5 or dt.strftime("%Y-%m-%d") in self._holidays:
             return 0.0
         target = dt.replace(
@@ -2796,8 +2799,6 @@ except ImportError:
 
 
 logger = logging.getLogger("hit_rate_analyzer")
-IST = timezone(timedelta(hours=5, minutes=30))
-
 # NSE market hours
 MARKET_OPEN_MINUTES = 9 * 60 + 15    # 09:15 IST
 MARKET_CLOSE_MINUTES = 15 * 60 + 30  # 15:30 IST
@@ -2954,6 +2955,10 @@ class DataFlowHealthMonitor:
         # Track which symbols received at least one valid tick
         self.symbols_with_data: set = set()
         self.first_tick_time: Optional[float] = None
+        # `last_tick_time` is updated on EVERY successfully-parsed tick and
+        # is used by the session's health thread to detect a stale WebSocket
+        # feed (process alive, but no data flowing — silent failure mode).
+        self.last_tick_time: Optional[float] = None
 
         self._first_tick_alerted = False
         self._parse_failure_alerted = False
@@ -2965,16 +2970,27 @@ class DataFlowHealthMonitor:
             self.msgs_received += 1
             if parse_success and symbol:
                 self.msgs_parsed_ok += 1
+                now = time.time()
                 if self.first_tick_time is None:
-                    self.first_tick_time = time.time()
-                    elapsed = self.first_tick_time - self.started_at
+                    self.first_tick_time = now
+                    elapsed = now - self.started_at
                     logger.info("✅ FIRST VALID TICK received after %.1fs from %s",
                                 elapsed, symbol)
+                self.last_tick_time = now
                 self.symbols_with_data.add(symbol)
             else:
                 self.msgs_parse_failed += 1
                 if parse_reason:
                     self.parse_failure_reasons[parse_reason] += 1
+
+    def seconds_since_activity(self) -> float:
+        """
+        Seconds since either startup or the most recent valid tick, whichever
+        is later. Used by the stale-feed auto-exit guard.
+        """
+        with self._lock:
+            baseline = self.last_tick_time if self.last_tick_time else self.started_at
+        return time.time() - baseline
 
     def check_health_and_warn(self) -> None:
         """Called periodically from health thread. Prints loud warnings."""
@@ -3287,7 +3303,6 @@ class LiveSignalMonitor:
         self.total_added = 0
         self.total_closed = 0
         self.total_max_horizon_closed = 0
-        self.total_timeout_closed = 0
 
         # Concurrent access from worker + UI thread
         self._lock = threading.RLock()
@@ -3416,7 +3431,12 @@ class LiveSignalMonitor:
                         self.total_closed += 1
                         continue
 
-                # Close conditions
+                # Close condition — max horizon reached.
+                # Note: an older `elif elapsed > self.max_age_s: close as
+                # "timeout"` branch was removed. Because max_age_s is
+                # forced to `max(user_val, max_horizon + 30)` and each
+                # signal's max_horizon_s == self.max_horizon, the timeout
+                # branch was unreachable in practice.
                 if elapsed >= sig.max_horizon_s:
                     sig.is_closed = True
                     sig.close_reason = "max_horizon"
@@ -3425,14 +3445,6 @@ class LiveSignalMonitor:
                     newly_closed.append(sig)
                     self.total_closed += 1
                     self.total_max_horizon_closed += 1
-                elif elapsed > self.max_age_s:
-                    sig.is_closed = True
-                    sig.close_reason = "timeout"
-                    del self._open[sig_id]
-                    self.recently_closed.append(sig)
-                    newly_closed.append(sig)
-                    self.total_closed += 1
-                    self.total_timeout_closed += 1
                 else:
                     still_open_ids.append(sig_id)
 
@@ -4285,6 +4297,14 @@ class LiveHitRateSession:
         # Shutdown
         self._shutdown_event = threading.Event()
 
+        # -- Stale-feed auto-exit (production reliability) --
+        # If we go this long during NSE market hours without a single valid
+        # tick, treat the WebSocket as silently dead. The health thread sets
+        # `stale_feed_detected` and the main loop breaks out with a distinct
+        # exit code so systemd (Restart=always) can restart the process.
+        self.stale_feed_seconds: float = 90.0
+        self.stale_feed_detected: bool = False
+
     def prepare(self) -> Dict[str, int]:
         """Login + scrip master + token resolution."""
         self.connector.login()
@@ -4416,11 +4436,41 @@ class LiveHitRateSession:
         self._health_thread.start()
 
     def _health_check_loop(self) -> None:
-        """Background thread — check data flow health, warn if broken."""
+        """
+        Background thread — check data flow health, warn if broken, and
+        request a shutdown if the feed has gone stale during market hours
+        (silent-failure recovery for VPS deployments).
+        """
         while not self._shutdown_event.is_set():
             time.sleep(5.0)
             try:
                 self.health.check_health_and_warn()
+
+                # Stale-feed detection: only meaningful during actual
+                # NSE market hours. Outside those hours "no ticks" is
+                # the expected state and must NOT trigger a restart.
+                if (not self.stale_feed_detected
+                        and self.stale_feed_seconds > 0
+                        and is_market_hours()
+                        and self.health.seconds_since_activity() > self.stale_feed_seconds):
+                    silent = self.health.seconds_since_activity()
+                    logger.critical(
+                        "🚨 STALE FEED — no valid ticks for %.0fs during "
+                        "market hours. Requesting shutdown so systemd can "
+                        "restart the process (Restart=always).",
+                        silent,
+                    )
+                    # Print once loudly to stdout too (in case journal is
+                    # not being tailed).
+                    print(
+                        "\n" + "=" * 72 +
+                        f"\n🚨 STALE FEED after {silent:.0f}s in market hours — exiting for restart"
+                        f"\n" + "=" * 72 + "\n",
+                        flush=True,
+                    )
+                    # Setting the flag is enough — main() polls it and
+                    # exits cleanly with return code 75 (EX_TEMPFAIL).
+                    self.stale_feed_detected = True
             except Exception as e:
                 logger.debug("Health check error: %s", e)
 
@@ -5283,6 +5333,10 @@ Examples:
     p.add_argument("--engine-demo", action="store_true",
                    help="Run the 8-scenario BookDynamicsEngine self-test "
                         "(no config or network needed) and exit.")
+    p.add_argument("--stale-feed-sec", type=float, default=90.0,
+                   help="Exit with code 75 (for systemd auto-restart) if no "
+                        "valid tick arrives for this many seconds during NSE "
+                        "market hours. Default 90.0. Set 0 to disable.")
     p.add_argument("--survival-min-favor-pct", type=float, default=0.0001,
                    help="Minimum favorable MFE %% within the survival "
                         "window (default 0.0001 = 0.01%%). Below this, the "
@@ -5570,6 +5624,7 @@ def main() -> int:
         dump_path=args.dump_path,
         engine_config=engine_config,
     )
+    session.stale_feed_seconds = max(0.0, float(args.stale_feed_sec))
 
     # -- STARTUP PROGRESS INDICATORS (each stage clearly logged) --
     print()
@@ -5653,6 +5708,9 @@ def main() -> int:
     max_duration_sec = args.duration_hours * 3600
     start_ts = time.time()
     last_headless_status = start_ts
+    # Set by the wait loops when the health thread detects a silently-dead
+    # feed. When True, main returns 75 (EX_TEMPFAIL) so systemd restarts.
+    stale_feed_shutdown = False
 
     try:
         if args.no_ui or not RICH_AVAILABLE:
@@ -5668,6 +5726,9 @@ def main() -> int:
                     break
                 if not args.skip_market_hours_check and seconds_until_market_close() <= 0:
                     logger.info("Market close reached.")
+                    break
+                if session.stale_feed_detected:
+                    stale_feed_shutdown = True
                     break
                 # Status every 10 seconds
                 if time.time() - last_headless_status >= 10.0:
@@ -5685,6 +5746,9 @@ def main() -> int:
                     break
                 if not args.skip_market_hours_check and seconds_until_market_close() <= 0:
                     logger.info("Market close reached.")
+                    break
+                if session.stale_feed_detected:
+                    stale_feed_shutdown = True
                     break
             ui.stop()
             ui_thread.join(timeout=2.0)
@@ -5730,6 +5794,16 @@ def main() -> int:
         logger.info(f"EOD report saved: {args.report_path}")
     except Exception as e:
         logger.warning(f"Could not save report to {args.report_path}: {e}")
+
+    # If we broke out because the feed went silent during market hours,
+    # exit with EX_TEMPFAIL so a systemd unit with Restart=always will
+    # restart us. Partial report above is still written for audit.
+    if stale_feed_shutdown:
+        logger.critical(
+            "Exiting with code 75 (EX_TEMPFAIL) due to stale feed — "
+            "systemd should restart the process.",
+        )
+        return 75
 
     return 0
 
