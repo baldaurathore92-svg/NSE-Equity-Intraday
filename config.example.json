@@ -93,6 +93,22 @@
         "iceberg_price_hold_bps": 5.0,
 
         "_comment_kill_switch": "Kill-switch triggers when spread exceeds median × N. Default 3.0. Set 2.0 for tighter fast-market protection.",
-        "kill_switch_spread_multiplier": 3.0
+        "kill_switch_spread_multiplier": 3.0,
+
+        "_comment_v2_backports": "V2 'Sniper Edition' backports. All default to disabled/passive so existing users see no behavior change. Enable per your needs. See CLI --help for detailed guidance.",
+
+        "_comment_l1_gate": "Force f_l1=0 in composite when spread widens beyond this many bps (illiquidity-trap defense). Default 999 = disabled. Try 5.0 for Nifty50 large caps where wide spread + thin ask can produce misleading L1=+0.95 signals.",
+        "l1_max_spread_bps": 999.0,
+
+        "_comment_kill_max_bps": "Absolute-bps ceiling for kill switch. Forces SUPPRESSED whenever current spread exceeds this value, in addition to the multiplier-based check above. Default 999 = disabled. Set 5.0 for tight-market discipline.",
+        "kill_switch_max_spread_bps": 999.0,
+
+        "_comment_score_mode": "Composite score aggregation. 'average' (default) divides by total sum-of-weights. 'confluence' divides by weight-of-active-features only (features whose |value| > active_feature_threshold). Rationale: neutral features shouldn't dilute strong signals from features that do agree.",
+        "score_mode": "average",
+        "active_feature_threshold": 0.05,
+
+        "_comment_exit_signals": "Emit EXIT_LONG / EXIT_SHORT when L1 imbalance flips against the last actionable direction by more than exit_l1_flip_threshold. EXIT states are close-position signals, deliberately NOT in _ACTIONABLE_STATES so the hit-rate recorder ignores them.",
+        "emit_exit_signals": false,
+        "exit_l1_flip_threshold": 0.3
     }
 }

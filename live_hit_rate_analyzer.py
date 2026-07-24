@@ -113,6 +113,14 @@ class SignalState(Enum):
     SUPPRESSED   = kill switch active (spread blew out, circuit hit, or
                    the book crossed/locked) — signal generation intentionally
                    halted regardless of what the score says.
+
+    EXIT_LONG / EXIT_SHORT (opt-in, requires EngineConfig.emit_exit_signals):
+        Emitted when the last signal for the symbol was in one direction
+        and the L1 imbalance flips against it beyond
+        `exit_l1_flip_threshold`. These are CLOSE-position signals, not
+        NEW entries — they are deliberately NOT in _ACTIONABLE_STATES
+        so HitRateAnalyzer will not create fresh predictions for them.
+        Downstream consumers can subscribe to them to close open positions.
     """
     STRONG_LONG  = "STRONG_LONG"
     LONG         = "LONG"
@@ -122,6 +130,8 @@ class SignalState(Enum):
     SHORT        = "SHORT"
     STRONG_SHORT = "STRONG_SHORT"
     SUPPRESSED   = "SUPPRESSED"
+    EXIT_LONG    = "EXIT_LONG"     # close an existing LONG position
+    EXIT_SHORT   = "EXIT_SHORT"    # close an existing SHORT position
 
 
 class AggressorSide(Enum):
@@ -872,6 +882,15 @@ class SignalResult:
     reasons:           List[str]
     diagnostics:       Dict[str, Any]
     metrics:           BookMetrics
+    # Suggested "patient" entry price for the trader.
+    #   LONG-family states:  best_bid  (place a limit BUY here, wait to be
+    #                                   lifted — safest, no spread cross)
+    #   SHORT-family states: best_ask  (place a limit SELL here, wait to
+    #                                   be hit)
+    #   NEUTRAL / SUPPRESSED / EXIT_*: None
+    # Populated by the engine at signal-fire time so downstream consumers
+    # don't have to guess where to place the actual broker order.
+    entry_zone:        Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1076,6 +1095,46 @@ class EngineConfig:
     # contribute. Set to False to restore old behaviour.
     imbalance_roc_use_top5:   bool = True
 
+    # ==============================================================
+    # -- V2 backport: spread-gated L1 (Scan 6 #2) --
+    # ==============================================================
+    # In slow markets a wide spread can leave the ask side with tiny
+    # quantity (e.g. 50 shares) while the bid stacks 2000 — L1 imbalance
+    # jumps to +0.95 which reads as "STRONG buying pressure" but is
+    # actually just illiquidity on the ask side. When the true seller
+    # arrives, price drops immediately. Fix: if spread_bps exceeds this
+    # threshold, force f_l1 to 0 before feeding to composite.
+    #
+    # Default is effectively disabled (999.0). Set 5.0 to activate.
+    l1_max_spread_bps:        float = 999.0
+
+    # -- V2 backport: hard-bps kill switch ceiling (Scan 5 #6) --
+    # The existing multiplier-based kill switch (3.0 × 30-sec median)
+    # can miss absolute blowouts on tight-spread symbols. This adds an
+    # absolute-bps ceiling that suppresses signals whenever the current
+    # spread exceeds it, independent of the historical median.
+    # Default 999.0 = disabled. Set 5.0 for tight-market discipline.
+    kill_switch_max_spread_bps: float = 999.0
+
+    # -- V2 backport: EXIT signals (Scan 8 #4) --
+    # When True, the engine emits EXIT_LONG / EXIT_SHORT whenever the
+    # last actionable signal for the symbol was in one direction and
+    # the current L1 imbalance flips against it beyond
+    # exit_l1_flip_threshold. These are CLOSE signals, deliberately
+    # NOT in _ACTIONABLE_STATES so hit-rate recorder ignores them.
+    emit_exit_signals:        bool = False
+    exit_l1_flip_threshold:   float = 0.3     # |L1| flip magnitude
+
+    # -- V2 backport: composite score mode (Scan 7 #3) --
+    # "average":   weighted average over ALL features, divided by
+    #              sum-of-weights (original behaviour — default).
+    # "confluence": divide by sum-of-weights-of-ACTIVE-features
+    #              (features whose |value| > active_threshold).
+    #              Rationale: neutral features shouldn't dilute strong
+    #              signals from other features that DO agree.
+    score_mode:               str = "average"
+    active_feature_threshold: float = 0.05   # |value| above this = active
+
     # -- Aggressor volume window (addressed scan-3 concern that a flat
     #    5-second sum over-weights stale volume in slow markets). --
     # Length of the rolling window over which buy-side vs sell-side
@@ -1270,6 +1329,12 @@ class BookDynamicsEngine:
         # for 2-3 minutes at market open).
         self._warmup_ticks: int = 0
 
+        # -- V2 backport: track last actionable direction per engine
+        #    instance so we can emit EXIT_LONG / EXIT_SHORT when the L1
+        #    imbalance flips against it. Set to "LONG" or "SHORT" after
+        #    each actionable signal; cleared when an EXIT fires.
+        self._last_actionable_direction: Optional[str] = None
+
         # -- Iceberg / level-behaviour tracker --
         # Keyed by (side, price_key). Each value records the level's
         # baseline qty, first/last seen timestamps, refill count, count of
@@ -1398,6 +1463,7 @@ class BookDynamicsEngine:
             self._pull_events.clear()
             self._ema_score = None
             self._warmup_ticks = 0
+            self._last_actionable_direction = None
             self._last_ts = -1.0
             self._last_sequence = None
             self._last_exchange_ts = None
@@ -2062,6 +2128,17 @@ class BookDynamicsEngine:
         f_bw   = clamp(m.book_wide_imbalance, -1, 1)
         f_iroc = tanh_scale(m.imbalance_roc_5s, k=5.0)  # ±0.2 change → ~0.76
 
+        # -- V2 backport: spread-gated L1 (Scan 6 #2 illiquidity trap) --
+        # When spread widens beyond l1_max_spread_bps, one side of L1
+        # usually gets thin and L1 imbalance flips to a spurious ±0.9+.
+        # Force f_l1 = 0 in that regime so the composite doesn't misread
+        # "empty ask side" as "STRONG buying pressure".
+        # Default l1_max_spread_bps = 999 (effectively disabled).
+        l1_spread_gated = False
+        if m.normalized_spread_bps > cfg.l1_max_spread_bps:
+            f_l1 = 0.0
+            l1_spread_gated = True
+
         # Net liquidity flow: (bid growth - ask growth), normalized by activity
         net_flow = (m.buy_added - m.buy_removed) - (m.sell_added - m.sell_removed)
         f_flow = tanh_scale(
@@ -2098,7 +2175,25 @@ class BookDynamicsEngine:
             (cfg.w_iceberg,             f_ice,  "Iceberg"),
         ]
         w_sum = sum(w for w, _, _ in weighted)
-        raw_norm = safe_div(sum(w * v for w, v, _ in weighted), w_sum)  # in [-1, +1]
+
+        # -- V2 backport: composite score MODE (Scan 7 #3) --
+        # "average"    → weighted average over ALL features, divided by
+        #                total sum-of-weights (original — default).
+        # "confluence" → divide by sum-of-weights of ACTIVE features only,
+        #                where "active" means |value| > active_feature_threshold.
+        #                Rationale: neutral features shouldn't dilute the
+        #                magnitude of strong signals from features that do
+        #                agree. Falls back to "average" denominator when no
+        #                feature is active (avoids div-by-zero).
+        if cfg.score_mode == "confluence":
+            active_sum = sum(
+                w for w, v, _ in weighted
+                if abs(v) > cfg.active_feature_threshold
+            )
+            denominator = active_sum if active_sum > 0 else w_sum
+        else:
+            denominator = w_sum
+        raw_norm = safe_div(sum(w * v for w, v, _ in weighted), denominator)
 
         # Spoof dampener — reduces conviction, does not flip direction
         dampener = 1.0 - cfg.spoof_dampener_strength * m.spoofing_suspicion
@@ -2153,6 +2248,21 @@ class BookDynamicsEngine:
         # State mapping
         state = self._score_to_state(smoothed)
 
+        # -- V2 backport: hard-bps kill switch ceiling (Scan 5 #6) --
+        # In addition to the multiplier-based kill switch (spread vs 30-sec
+        # median), if the current spread exceeds an ABSOLUTE ceiling, we
+        # force SUPPRESSED regardless of history. Useful for tight-market
+        # discipline on liquid names where the median-based check is
+        # slow to react.
+        # Default kill_switch_max_spread_bps = 999.0 (disabled).
+        if m.normalized_spread_bps > cfg.kill_switch_max_spread_bps:
+            state = SignalState.SUPPRESSED
+            m.kill_switch_active = True
+            m.kill_switch_reason = (
+                f"Spread {m.normalized_spread_bps:.1f} bps "
+                f"exceeds hard ceiling {cfg.kill_switch_max_spread_bps:.1f} bps"
+            )
+
         # -- EMA WARM-UP GATE --
         # Suppress signals until the EMA has processed enough ticks to
         # actually reflect recent flow rather than the neutral zero seed.
@@ -2166,15 +2276,64 @@ class BookDynamicsEngine:
         else:
             warmup_note = None
 
+        # -- V2 backport: EXIT signals (Scan 8 #4) --
+        # If the last actionable signal was in one direction and current
+        # L1 imbalance has flipped strongly against it, emit an EXIT_*
+        # state so downstream position-management logic can close.
+        # Only runs after the warm-up window and only when opted in.
+        exit_note: Optional[str] = None
+        if (cfg.emit_exit_signals
+                and self._last_actionable_direction is not None
+                and self._warmup_ticks >= cfg.ema_warmup_ticks):
+            l1 = m.l1_imbalance
+            if (self._last_actionable_direction == "LONG"
+                    and l1 < -cfg.exit_l1_flip_threshold):
+                state = SignalState.EXIT_LONG
+                exit_note = (
+                    f"EXIT_LONG: L1 imbalance flipped to {l1:+.3f} "
+                    f"(threshold ±{cfg.exit_l1_flip_threshold:.2f})"
+                )
+                self._last_actionable_direction = None
+            elif (self._last_actionable_direction == "SHORT"
+                    and l1 > cfg.exit_l1_flip_threshold):
+                state = SignalState.EXIT_SHORT
+                exit_note = (
+                    f"EXIT_SHORT: L1 imbalance flipped to {l1:+.3f} "
+                    f"(threshold ±{cfg.exit_l1_flip_threshold:.2f})"
+                )
+                self._last_actionable_direction = None
+
+        # Update _last_actionable_direction only after final state known.
+        # (SUPPRESSED / NEUTRAL / EXIT_* do NOT update the tracker.)
+        if state in (SignalState.STRONG_LONG, SignalState.LONG, SignalState.WEAK_LONG):
+            self._last_actionable_direction = "LONG"
+        elif state in (SignalState.STRONG_SHORT, SignalState.SHORT, SignalState.WEAK_SHORT):
+            self._last_actionable_direction = "SHORT"
+
         # Evidence strength = |score| * agreement factor
         agreement = self._agreement_ratio(weighted, smoothed)
         evidence = clamp(abs(smoothed) * (0.5 + 0.5 * agreement) * 10.0, 0.0, 100.0)
 
         reasons = self._compose_reasons(m, weighted, smoothed, agreement)
+        if l1_spread_gated:
+            reasons.insert(0, f"L1 spread-gated (spread {m.normalized_spread_bps:.1f} bps)")
+        if exit_note is not None:
+            reasons.insert(0, exit_note)
         if warmup_note is not None:
             reasons.insert(0, warmup_note)
         if regime_note is not None:
             reasons.insert(0, regime_note)
+
+        # -- V2 backport: patient entry zone --
+        # LONG family:  best_bid (place limit BUY at bid, wait to be lifted)
+        # SHORT family: best_ask (place limit SELL at ask, wait to be hit)
+        # EXIT / NEUTRAL / SUPPRESSED: None (no fresh order recommendation)
+        if state in (SignalState.STRONG_LONG, SignalState.LONG, SignalState.WEAK_LONG):
+            entry_zone = snap.best_bid
+        elif state in (SignalState.STRONG_SHORT, SignalState.SHORT, SignalState.WEAK_SHORT):
+            entry_zone = snap.best_ask
+        else:
+            entry_zone = None
 
         return SignalResult(
             timestamp=snap.timestamp,
@@ -2184,6 +2343,7 @@ class BookDynamicsEngine:
             smoothed_score=smoothed,
             evidence_strength=evidence,
             reasons=reasons,
+            entry_zone=entry_zone,
             diagnostics=self._diagnostics(m),
             metrics=m,
         )
@@ -2865,6 +3025,10 @@ def load_config(path: str) -> ScannerConfig:
             "iceberg_price_hold_bps",
             # imbalance_roc source (top-5 vs full book)
             "imbalance_roc_use_top5",
+            # V2 backports
+            "l1_max_spread_bps", "kill_switch_max_spread_bps",
+            "emit_exit_signals", "exit_l1_flip_threshold",
+            "score_mode", "active_feature_threshold",
         ]:
             if fld in ec:
                 setattr(ecfg, fld, type(getattr(ecfg, fld))(ec[fld]))
@@ -6987,6 +7151,36 @@ Examples:
                         "instead of top-5 sum. Default is top-5, which "
                         "avoids Level-10+ fake-order poisoning.")
 
+    # -- V2 backport CLI flags (all opt-in; defaults preserve current behaviour) --
+    p.add_argument("--l1-max-spread-bps", type=float, default=None,
+                   help="Spread-gated L1 imbalance (illiquidity-trap defense). "
+                        "When normalized_spread_bps exceeds this, force "
+                        "f_l1 = 0 in the composite. Default 999 (disabled). "
+                        "Recommended 5.0 for large-cap Nifty50 discipline.")
+    p.add_argument("--kill-switch-max-spread-bps", type=float, default=None,
+                   help="Hard absolute-bps ceiling for the kill switch. "
+                        "Suppresses signals when current spread exceeds "
+                        "this value, independent of the multiplier check. "
+                        "Default 999 (disabled). Set 5.0 for tight-market "
+                        "discipline.")
+    p.add_argument("--score-mode", choices=["average", "confluence"],
+                   default=None,
+                   help="Composite score aggregation mode. 'average' "
+                        "(default) divides by sum-of-all-weights. "
+                        "'confluence' divides only by weight-of-active-"
+                        "features (|value| > active_feature_threshold) so "
+                        "neutral features don't dilute strong signals.")
+    p.add_argument("--emit-exit-signals", action="store_true",
+                   help="Emit EXIT_LONG / EXIT_SHORT when L1 imbalance "
+                        "flips against the last actionable direction by "
+                        "--exit-l1-flip-threshold. Default OFF. EXIT states "
+                        "are NOT in _ACTIONABLE_STATES so hit-rate recorder "
+                        "ignores them.")
+    p.add_argument("--exit-l1-flip-threshold", type=float, default=None,
+                   help="|L1 imbalance| threshold at which an EXIT signal "
+                        "fires against the previous direction. Default 0.3. "
+                        "Only applied when --emit-exit-signals is set.")
+
     # -- EMA warm-up (Cold-Start Trap fix) --
     p.add_argument("--ema-warmup-ticks", type=int, default=None,
                    help="Suppress signals for the first N ticks so the EMA "
@@ -7299,6 +7493,22 @@ def main() -> int:
     if args.imbalance_roc_from_book_wide:
         engine_config.imbalance_roc_use_top5 = False
         threshold_overrides.append("imbalance_roc=book_wide")
+    # -- V2 backport flags --
+    if args.l1_max_spread_bps is not None:
+        engine_config.l1_max_spread_bps = args.l1_max_spread_bps
+        threshold_overrides.append(f"l1_max_spread={args.l1_max_spread_bps}bps")
+    if args.kill_switch_max_spread_bps is not None:
+        engine_config.kill_switch_max_spread_bps = args.kill_switch_max_spread_bps
+        threshold_overrides.append(f"kill_switch_max={args.kill_switch_max_spread_bps}bps")
+    if args.score_mode is not None:
+        engine_config.score_mode = args.score_mode
+        threshold_overrides.append(f"score_mode={args.score_mode}")
+    if args.emit_exit_signals:
+        engine_config.emit_exit_signals = True
+        threshold_overrides.append("exit_signals=ON")
+    if args.exit_l1_flip_threshold is not None:
+        engine_config.exit_l1_flip_threshold = args.exit_l1_flip_threshold
+        threshold_overrides.append(f"exit_flip={args.exit_l1_flip_threshold}")
     if args.ema_warmup_ticks is not None:
         engine_config.ema_warmup_ticks = args.ema_warmup_ticks
         threshold_overrides.append(f"ema_warmup={args.ema_warmup_ticks}")
