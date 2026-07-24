@@ -1,414 +1,305 @@
-# NSE Equity Intraday — Real-Time Book Dynamics Scanner
+# NSE Equity Intraday — Live Hit-Rate Analyzer
 
-**Production-ready order-flow / market-microstructure analytics** के लिए NSE Cash Market Level-2 SnapQuote data पर 100 symbols को parallel में scan करने वाला system।
+**एक single-file, Hindi-friendly tool जो Angel One की live NSE Cash Market
+feed पर scanner के signals का real hit-rate माप कर बताता है — कोई real order
+भेजे बिना, कोई capital risk किए बिना।**
 
-> कोई candlestick नहीं, कोई RSI/MACD नहीं, कोई OHLC नहीं।
-> केवल **real-time tick-by-tick book dynamics** — Angel One SmartAPI + BookDynamicsEngine पर।
+> यह prediction accuracy measurement है, trading advice नहीं। ना कोई
+> candlestick / RSI / MACD / OHLC — केवल **tick-by-tick order-book
+> microstructure** पर 17 metrics से composite score, plus configurable
+> "sniper" entry/exit rules। Real edge है या noise — data बताएगा।
 
 ---
 
-## 🎯 वर्तमान Focus — Single-file Live Hit Rate Analyzer
+## 🚀 Quickstart — तीन commands
 
-अब यह repo सिर्फ एक tool पर focused है: **`live_hit_rate_analyzer.py`**।
-`paper_trader.py`, `live_dual_analyzer.py`, `tick_recorder.py`,
-`historical_backtest.py`, `COMPARE.sh` और `RECREATE_PROMPT.md` हटा दिए गए हैं।
-
-### Runtime पर सिर्फ इन files की ज़रूरत है
-
-- `live_hit_rate_analyzer.py` — SINGLE Python file (~5,800 lines): engine + Angel One WS adapter + session/RVOL gates + HitRateAnalyzer + CLI + rich UI
-- `config.json` (user creates from `config.example.json`)
-- `SETUP.sh` — SINGLE shell file: install + run + systemd service (सारे modes flags पर)
-
-### `SETUP.sh` modes
+Fresh Ubuntu 22.04+ VPS पर zero-to-running:
 
 ```bash
-bash SETUP.sh                    # install + 15-min diagnostic (default)
-bash SETUP.sh --full             # install + 6.5-hour full trading day
-bash SETUP.sh --duration N       # install + N-hour custom run
-bash SETUP.sh --setup-only       # install only, don't launch analyzer
-bash SETUP.sh --run              # skip install, just launch (env must be ready)
-bash SETUP.sh --engine-demo      # 8-scenario engine self-test (no config)
-bash SETUP.sh --install-service  # register systemd unit + auto-start on VPS
-bash SETUP.sh --service-status   # systemctl status
-bash SETUP.sh --service-logs     # journalctl -f
-bash SETUP.sh --service-start    # systemctl start
-bash SETUP.sh --service-stop     # systemctl stop
-bash SETUP.sh --uninstall-service # remove systemd unit
-bash SETUP.sh --help             # show all modes
-```
-
-### One-command run
-
-```bash
-bash SETUP.sh --full -- --strong-only \
-    --entry-confirmation-sec 15 \
-    --survival-check-sec 15 --survival-min-favor-pct 0.0001
-```
-
-नीचे बाकी दस्तावेज़ historical reference के तौर पर बना हुआ है; कुछ command
-examples (paper_trader / tick_recorder / historical_backtest वाले) अब उपलब्ध
-नहीं हैं और सिर्फ पुराने architecture का हवाला हैं।
-
----
-
-## 🏗️ Architecture
-
-```
-┌─────────────────────────┐
-│ Angel One SmartAPI      │  WebSocket V2 (SnapQuote mode)
-│ Level-2 Top-5 depth     │
-└───────────┬─────────────┘
-            │
-            ▼  ~5µs enqueue
-┌─────────────────────────┐
-│ Tick Queue (20k buffer) │  Producer-consumer decoupling
-│   (backpressure-aware)  │
-└───────────┬─────────────┘
-            │
-            ▼  ~100µs process
-┌─────────────────────────┐
-│ BookDynamicsEngine ×100 │  17 microstructure metrics/symbol
-│  - L1 / Top-5 / Book-   │  - Rolling ROC (1s/5s/10s)
-│    wide imbalance       │  - Spoof / Iceberg suspicion
-│  - Weighted depth       │  - Kill switch (spread / circuit)
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│ Ranked Signal Output    │  JSONL log + Live rich UI
-│  STRONG_LONG / LONG     │  Top-N bullish + bearish
-│  WEAK_LONG / NEUTRAL    │  Evidence strength 0-100
-│  WEAK_SHORT / SHORT     │
-│  STRONG_SHORT           │
-└─────────────────────────┘
-```
-
----
-
-## ⚡ Performance (measured on 1-core VPS)
-
-| Load | Throughput | Latency p50 | Latency p99 | Drops |
-|------|-----------|-------------|-------------|-------|
-| NSE normal (500 tps) | 502 tps ✅ | 100 µs | 248 µs | 0 |
-| Opening burst (3,000 tps) | 2,923 tps ✅ | 105 µs | 296 µs | 0 |
-| Extreme (10,000 tps) | 7,321 tps | 106 µs | 2 ms | 0 (queue absorbs) |
-
----
-
-## 🚀 Quick Start
-
-### 1. Local machine पर test (कोई credentials नहीं चाहिए)
-
-```bash
-# Clone repo
+# 1. Repo clone
 git clone https://github.com/baldaurathore92-svg/NSE-Equity-Intraday.git
 cd NSE-Equity-Intraday
 
-# Dependencies
-pip install -r requirements.txt
+# 2. सब कुछ install + Angel One credentials भरो (nano खुलेगा) + engine test
+bash SETUP.sh --setup-only
 
-# Engine self-test (8 synthetic scenarios)
-python3 nse_book_scanner.py --demo
-
-# Simulate mode with fake ticks (100 symbols)
-python3 nse_book_scanner.py --mode simulate
-
-# Higher rate simulation
-python3 nse_book_scanner.py --mode simulate --sim-rate 30
+# 3. Live analyzer चलाओ — 15-second sniper policy default में लगी हुई
+bash SETUP.sh --full -- --strong-only \
+    --entry-confirmation-sec 15 \
+    --survival-check-sec 15 \
+    --survival-min-favor-pct 0.0001
 ```
 
-### 2. Live trading — Angel One credentials चाहिए
-
+**Zero-config credential test (no broker needed):**
 ```bash
-# Config template copy करें
-cp config.example.json config.json
-chmod 600 config.json
-
-# Edit config.json — Angel One API key, client code, MPIN, TOTP secret भरें
-nano config.json
-
-# Live mode
-python3 nse_book_scanner.py --mode live
+bash SETUP.sh --engine-demo   # 8 synthetic scenarios: engine sanity check
 ```
 
-### 3. VPS पर deploy (production)
-
-```bash
-# One-command auto-installer (Ubuntu 22.04+)
-./deploy_vps.sh
-
-# Systemd auto-restart service
-./install_service.sh
-sudo systemctl start nse-scanner
-journalctl -u nse-scanner -f
-```
-
-Full VPS guide: see `deploy_vps.sh` output या project wiki।
-
----
-
-## 📊 Signal Output Example
-
-`logs/signals.jsonl` में हर actionable signal:
-
-```json
-{
-  "ts": 1721544123.456,
-  "symbol": "RELIANCE-EQ",
-  "state": "STRONG_LONG",
-  "raw_score": 8.34,
-  "smoothed_score": 8.12,
-  "evidence": 82.1,
-  "reasons": [
-    "Composite score +8.12/10 (bullish), feature agreement 100%",
-    "  L1=+0.72 (w=1.0)",
-    "  WeightedDepth=+0.68 (w=2.0)",
-    "  ImbalanceROC5s=+0.85 (w=2.5)"
-  ],
-  "diagnostics": {
-    "L1_imbalance": 0.72,
-    "Top5_imbalance": 0.61,
-    "Spread_bps": 4.2,
-    "BuyerAggressorRatio_5s": 0.82,
-    "Spoof_Susp": 0.05
-  }
-}
-```
-
----
-
-## 🧠 The 17 Microstructure Metrics
-
-Analysed per tick, per symbol:
-
-**Static Imbalances** ([-1, +1] range, +ve = bullish)
-1. `book_wide_imbalance` — Full book TBQ vs TSQ
-2. `l1_imbalance` — Best bid vs best ask qty
-3. `top5_imbalance` — Sum Top-5 bids vs asks
-4. `weighted_depth_imbalance` — Exponential distance-weighted
-
-**Dynamics (ROC)**
-5. `buy_book_roc_1s / 5s / 10s`
-6. `sell_book_roc_1s / 5s / 10s`
-7. `imbalance_roc_5s`
-
-**Liquidity Flow**
-8. `buy_added / buy_removed / sell_added / sell_removed`
-9. `book_activity`
-
-**Price Response**
-10. `spread` / `normalized_spread_bps`
-11. `mid_price_roc_5s`
-12. `ltp_roc_5s`
-13. `buyer_aggressor_ratio_5s` (tick rule)
-14. `interval_volume`
-
-**Suspicion Scores** ([0, 1])
-15. `l1_vs_depth_divergence`
-16. `execution_likelihood_ask / bid`
-17. `spoofing_suspicion` + `iceberg_suspicion` + `replenishment_score`
-
-Composite = Weighted sum → EMA smoothed → `[-10, +10]` score → Signal state.
-
----
-
-## 🎯 Phase 1: PredictionTracker (Signal Accuracy Self-Validation)
-
-Scanner **खुद ही measure करता है** कि उसके signals actually बाद में सही निकले या नहीं।
-कोई अंदाज़ा नहीं, कोई backtest hype नहीं — live empirical proof।
-
-**कैसे काम करता है:**
-1. जब actionable signal fire हो (LONG/SHORT states), current LTP capture
-2. Configured horizons (default: 30s / 60s / 120s) पर pending predictions create
-3. उसी symbol के अगले ticks पर, horizon expire होते ही:
-   - Current price vs signal-fire price → directional return
-   - LONG signal + price up = ✓ hit
-   - SHORT signal + price down = ✓ hit
-   - Transaction cost (default 0.06%) deduct करके actual net edge
-4. Per-state × horizon aggregated stats → live UI panel + JSONL audit trail
-
-**UI Panel Example:**
-
-```
-📈  Prediction Accuracy @ 60s horizon  (cost model: −0.06% round-trip)
-┏━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━━┓
-┃ Signal State ┃ Samples┃ Hit %  ┃ AvgRet  ┃ NetEdge ┃ Verdict         ┃
-┡━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━━━━━┩
-│ STRONG_LONG  │    42  │  58.3% │  +0.12% │ +0.06%  │ ✓ EDGE          │
-│ LONG         │   118  │  52.1% │  +0.04% │ -0.02%  │ ✗ break-even    │
-│ WEAK_LONG    │   256  │  49.6% │  +0.01% │ -0.05%  │ ✗ noise (loss)  │
-│ STRONG_SHORT │    38  │  57.8% │  -0.14% │ +0.08%  │ ✓ EDGE          │
-└──────────────┴────────┴────────┴─────────┴─────────┴─────────────────┘
-```
-
-यह real-time proof देता है कि **कौन-सी signal states में असली edge है और कौन-सी में नहीं।**
-अक्सर सिर्फ STRONG_LONG/STRONG_SHORT ही tradeable होंगे, weak signals noise होंगे।
-
-**JSONL output** (`logs/predictions.jsonl`): हर evaluated prediction का पूरा record —
-`ts_fired`, `ts_evaluated`, `symbol`, `state`, `score`, `evidence`,
-`price_at_signal`, `price_at_horizon`, `directional_return_pct`, `net_return_pct`,
-`is_hit`, `is_net_profitable`, `timed_out`.
-
-**Config** (in `config.example.json`):
-```json
-"prediction_horizons_s": [30.0, 60.0, 120.0],
-"transaction_cost_pct": 0.0006,
-"prediction_display_horizon_s": 60.0,
-"prediction_min_samples_for_verdict": 20
-```
-
----
-
-## 🌀 Phase 2: Regime Detector (`--regime-adaptive`)
-
-Real markets change character throughout the day. What worked in trending regime
-fails in mean-reverting. Phase 2 classifies current regime per-symbol on 3
-dimensions and adapts trading behavior automatically.
-
-### Regime Dimensions
-
-| Dimension | Values | Detection Method |
-|-----------|--------|------------------|
-| **Volatility** | LOW / NORMAL / HIGH | Recent σ vs baseline σ ratio |
-| **Trend** | TRENDING_UP / TRENDING_DOWN / MEAN_REVERTING / RANDOM | Lag-1 autocorrelation of tick returns |
-| **Depth Bias** | BULL_STRUCTURAL / BEAR_STRUCTURAL / BALANCED | Rolling mean of book-wide imbalance |
-
-### Adaptive Behavior
-
-- **RANDOM regime** → Skip signal (no directional edge to exploit)
-- **MEAN_REVERTING regime** → INVERT signal (LONG becomes SHORT, contrarian trade)
-- **HIGH_VOL regime** → Widen entry threshold (1.3×) + halve position size
-- **LOW_VOL regime** → Tighten entry threshold (0.85×) to catch more marginal moves
-- **TRENDING regime** → Use signals as-is (normal directional trade)
-
-### Live Paper Trading on Real Angel One Data
-
-```bash
-# Simulation with Phase 2 (no broker needed)
-python3 paper_trader.py --duration-min 60 --regime-adaptive
-
-# LIVE paper trading on real Angel One WebSocket (during NSE market hours)
-python3 paper_trader.py --feed live --config config.json --duration-min 390 --regime-adaptive
-
-# Aggressive tuning
-python3 paper_trader.py --feed live --config config.json --regime-adaptive \
-    --entry-score 3 --entry-evidence 25
-```
-
-### What Phase 2 Adaptive Does NOT Do
-
-**⚠️ Important honesty:** Phase 2 is not a magic profit switch. In realistic
-simulation, adding `--regime-adaptive` may make results WORSE if the base
-scanner doesn't have real edge. Its actual value is:
-
-1. **Observability** — See exact regime distribution during trading hours
-2. **Risk management** — Auto-reduce size in HIGH_VOL periods
-3. **Real-market alpha discovery** — On real NSE data, mean-reversion inversions
-   may capture actual over-reaction alpha (simulator can't replicate this)
-
-Run on REAL Angel One data for 5-10 days before drawing conclusions about
-regime-adaptive value.
-
----
-
-## 📊 Live Hit Rate Analyzer (`live_hit_rate_analyzer.py`)
-
-**Real-time scanner + horizon-based statistical validator in one tool.**
-No trade simulation, no capital tracking — pure predictive accuracy measurement.
-
-### Two-Layer Tracking
-
-**1. Real-Time Layer** — Every tick, every open signal:
-- Current directional return (positive = signal is proving RIGHT NOW)
-- MFE (Max Favorable Excursion) — best moment during signal life
-- MAE (Max Adverse Excursion) — worst moment during signal life
-- Live verdict: "X open / Y winning / Z losing right now"
-
-**2. Statistical Layer** — At each configured horizon:
-- Multi-dimensional bucketed hit rate (state × horizon × evidence × regime × hour × symbol)
-- Cost-adjusted net edge
-- Honest verdict per bucket
-
-### What The UI Shows
-
-```
-╭─ ⚡ LIVE VERDICT (open signals): 24 open → 15 winning / 8 losing ─╮
-│  Hit rate now: 62.5%  |  Avg current: +0.043%  |  Evaluated: 342 │
-╰──────────────────────────────────────────────────────────────────╯
-
-⚡ LIVE OPEN SIGNALS — Real-time score verdict
-┏━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━━━┓
-┃ Symbol     ┃ State     ┃ Age ┃ Entry ┃ Now    ┃ Dir Ret┃ MFE    ┃ Status     ┃
-┡━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━━━┩
-│ RELIANCE-EQ│ STRONG_LONG│ 12s │ 2530.15│ 2534.22│+0.161% │+0.180% │✓✓ PROFITABLE│
-│ HDFCBANK-EQ│ LONG      │ 45s │ 3327.41│ 3325.02│-0.072% │+0.045% │✗ losing     │
-│ ...        │ ...       │ ... │ ...    │ ...    │...     │ ...    │ ...         │
-```
-
-**यह जवाब देता है:** "अभी scanner सही जा रहा है या गलत? Market हमारे हिसाब से चल रही है या नहीं?"
-
-### Multi-Horizon Statistical Analysis
-
-Every actionable signal fire पर 6 horizons पर pending records बनते हैं:
-5s / 15s / 30s / 60s / 120s / 300s। हर horizon expire होने पर actual price check।
-
-### Multi-Dimensional Breakdown
-
-| Dimension | What It Reveals |
-|-----------|-----------------|
-| **By State** (STRONG_LONG / LONG / WEAK_LONG / ...) | कौन-सा signal state predictive है? |
-| **By Horizon** (5s to 300s) | Optimal holding period क्या है? |
-| **By Evidence** (0-30 / 30-50 / 50-70 / 70+) | High-evidence signals बेहतर हैं? |
-| **By Regime** (Phase 2 label) | कौन-सा market regime tradeable है? |
-| **By Hour of Day** (IST) | Opening / mid / closing में accuracy अलग है? |
-| **By Symbol** (top-10 ranked) | कौन-से stocks scanner पर predict करते हैं? |
-
-### Usage
-
-```bash
-# Default 60-min session, rich UI
-python3 live_hit_rate_analyzer.py --config config.json
-
-# Full trading day headless (VPS tmux)
-python3 live_hit_rate_analyzer.py --config config.json --duration-hours 6.5 --no-ui
-
-# Custom horizons + symbols
-python3 live_hit_rate_analyzer.py --config config.json \
-    --horizons 10,30,60,180,600 --symbols RELIANCE-EQ,TCS-EQ,HDFCBANK-EQ
-
-# Custom transaction cost (0.10% instead of default 0.06%)
-python3 live_hit_rate_analyzer.py --config config.json --cost-pct 0.001
-```
-
-### 24/7 systemd Service (VPS)
-
+**24/7 auto-restart on VPS (systemd):**
 ```bash
 bash SETUP.sh --install-service
 bash SETUP.sh --service-start
-bash SETUP.sh --service-logs
+bash SETUP.sh --service-logs   # live journalctl tail
 ```
 
-Auto-starts every trading day, auto-stops at 15:30 IST, auto-restarts on crash.
+---
 
-### Sample Output — Real Data EOD Report
+## 📁 File Layout — बस 5 files हैं
+
+```
+NSE-Equity-Intraday/
+├── live_hit_rate_analyzer.py   ← SINGLE Python (~5,700 lines) — पूरा system
+├── SETUP.sh                    ← SINGLE shell — install + run + systemd
+├── config.example.json         ← credentials template (Nifty 100 symbols)
+├── requirements.txt            ← Python deps
+└── README.md                   ← यह file
+```
+
+Runtime पर आप बस दो files से interact करते हैं — `SETUP.sh` (operator के लिए)
+और `config.json` (credentials भरने के लिए)। बाकी सब automatic है।
+
+---
+
+## 🎯 यह tool क्या करता है (और क्या नहीं)
+
+### करता है ✅
+
+- Angel One SmartWebSocketV2 से Level-2 top-5 depth (SnapQuote mode) पर 100
+  symbols parallel में subscribe करता है
+- हर tick पर 17 microstructure metrics compute करके composite `[-10, +10]`
+  score निकालता है → EMA smoothed → State (STRONG_LONG / LONG / WEAK_LONG /
+  NEUTRAL / WEAK_SHORT / SHORT / STRONG_SHORT)
+- हर actionable signal को multiple horizons (default 5s / 15s / 30s / 60s /
+  120s / 300s) पर track करता है — real price movement से hit rate + net edge
+- 15-second **sniper policy** enforce करता है:
+  - **Entry confirmation:** signal तभी record होगा जब score लगातार 15 seconds
+    तक qualify करता रहे (fake spike/flash reject)
+  - **Survival exit:** entry के 15s बाद अगर MFE ≥ 0.01% नहीं है, signal तुरंत
+    square-off (breakeven exit)
+- Session phase gate, RVOL gate, cooldown gate, state filter — सब optional
+- Real-time rich UI (live winning/losing verdict) OR headless mode (VPS)
+- EOD comprehensive text report + JSONL audit trail
+
+### नहीं करता है ❌
+
+- कोई real order Angel One पर नहीं भेजता — **zero financial risk**
+- कोई candlestick / RSI / MACD / OHLC नहीं
+- Backtest नहीं करता (record→replay pipeline इस repo में नहीं है)
+- कोई paper-trading P&L simulation नहीं (सिर्फ hit-rate measurement)
+- कोई ML/AI / LSTM / transformer — पूरा math interpretable है
+
+---
+
+## 🎯 15-Second Sniper Policy (Gemini-style)
+
+बाज़ार में **alpha decay** होता है — जो signal 60 seconds पहले relevant था वो
+अब नहीं। साथ ही **fake spikes** से 35% win rate आती है। इन दोनों को defeat
+करने के लिए दो हार्ड rules:
+
+### Rule 1: 15-Second Entry Confirmation
+
+Signal fire होते ही तुरंत entry मत लो। पहले देखो — क्या यह score अगले
+**15 seconds** तक टिका रहता है?
+
+```
+t=0s   : score crosses +4.0 (STRONG_LONG threshold) → START confirmation
+t=5s   : score अभी भी ≥ 4.0 → pending qualifying
+t=10s  : score अभी भी ≥ 4.0 → pending qualifying
+t=15s  : score अभी भी ≥ 4.0 → CONFIRMED → record signal
+```
+
+अगर बीच में score threshold से गिर जाए, या direction flip हो, तो pending
+cancel + rearm। Same-side re-arming के लिए पहले state को leave zone करना ज़रूरी।
+
+**Flags:**
+- `--entry-confirmation-sec 15` (0 से disable)
+- `--entry-score 4.0` (calibrated STRONG threshold — 67k live signals पर
+  empirically tested; पुराने 8.0 default में STRONG_LONG कभी fire ही नहीं होता)
+- `--entry-evidence 30` (feature agreement × |score| × 10)
+
+### Rule 2: 15-Second Survival Exit
+
+Confirmed entry के **15 seconds** के अंदर अगर MFE (Max Favorable Excursion) ≥
+`0.01%` नहीं हुआ, तो signal उसी वक्त square-off। "अगर पहले 15s में मूव नहीं
+हुई, तो यह fake signal था — cost eat करने से पहले exit।"
+
+```
+Entry @ ask 100.05 (LONG STRONG signal)
+Survival check @ t=15s:
+  - Best MFE during 0-15s window = +0.008%  (< 0.01% threshold)
+  → FAIL → close at current bid → policy bucket में record
+  - Best MFE during 0-15s window = +0.025%  (≥ 0.01%)
+  → PASS → signal continues to max horizon (300s)
+```
+
+**Flags:**
+- `--survival-check-sec 15` (0 से disable)
+- `--survival-min-favor-pct 0.0001` (= 0.01%)
+
+### Two-Table Reporting
+
+EOD report में दो अलग tables:
+
+1. **HIT RATE BY STATE × HORIZON** — diagnostic view: बिना survival rule के
+   हर horizon पर क्या होता (5s/15s/30s/60s/120s/300s)
+2. **🎯 15-SECOND POLICY OUTCOME** — actual view: policy rules apply करने के बाद
+   per-state एक outcome per signal (survival_exit @ 15s OR max_horizon @ 300s)
+
+यह comparison दिखाता है — policy से कितना बेहतर या बदतर हुआ।
+
+---
+
+## 🛠️ `SETUP.sh` — सारे modes
+
+| Command | काम |
+|---|---|
+| `bash SETUP.sh` | Install (as needed) + 15-min diagnostic run |
+| `bash SETUP.sh --full` | Install + 6.5-hour full trading day |
+| `bash SETUP.sh --duration N` | Install + N-hour custom run |
+| `bash SETUP.sh --setup-only` | सिर्फ install; analyzer मत चलाओ |
+| `bash SETUP.sh --run` | Skip install; बस analyzer launch करो |
+| `bash SETUP.sh --engine-demo` | 8-scenario engine self-test (no config) |
+| `bash SETUP.sh --install-service` | Systemd unit register + enable auto-start |
+| `bash SETUP.sh --uninstall-service` | Systemd unit remove |
+| `bash SETUP.sh --service-status` | `systemctl status` |
+| `bash SETUP.sh --service-logs` | `journalctl -u ... -f` |
+| `bash SETUP.sh --service-start` | `systemctl start` |
+| `bash SETUP.sh --service-stop` | `systemctl stop` |
+| `bash SETUP.sh --help` | पूरी help |
+
+**Pass-through** any analyzer args after `--`:
+```bash
+bash SETUP.sh --full -- --strong-only --min-rvol 1.5 --session-filter
+```
+
+Systemd unit default में यह ExecStart use करता है:
+```
+--strong-only --entry-confirmation-sec 15 --entry-score 4.0 --entry-evidence 30
+--survival-check-sec 15 --survival-min-favor-pct 0.0001 --stale-feed-sec 90
+--no-ui --duration-hours 6.5
+```
+
+---
+
+## 🎛️ Analyzer CLI Flags Reference
+
+`bash SETUP.sh -- <args>` या directly `python3 live_hit_rate_analyzer.py <args>`।
+
+### Session
+- `--config PATH` — Angel One credentials file (default `config.json`)
+- `--duration-hours N` — session length (default 1.0)
+- `--symbols A,B,C` — subset filter (default all from config)
+- `--skip-market-hours-check` — force run outside 9:15–15:30 IST
+- `--no-ui` — headless mode (VPS friendly, prints status every 10s)
+- `--report-path PATH` — EOD report file location
+
+### Signal Filters
+- `--strong-only` — record ONLY `STRONG_LONG` + `STRONG_SHORT`
+- `--skip-weak` — record STRONG + LONG/SHORT (skip WEAK)
+- `--session-filter` — enable NSE phase gate (block LUNCH/PRE_CLOSE/CLOSING)
+- `--allowed-phases OPENING,MORNING,AFTERNOON` — customize allowed phases
+- `--no-entry-cutoff 15:15` — no new entries after this IST time
+- `--holidays 2026-01-26,...` — comma-separated NSE holidays (YYYY-MM-DD)
+- `--min-rvol 1.5` — require this relative volume vs 20-min average
+- `--rvol-window-minutes 20` — RVOL rolling window
+- `--rvol-warmup-buckets 5` — need this many 1-min buckets before RVOL valid
+- `--rvol-strict-warmup` — block signals during RVOL warmup instead of allow
+
+### 15-Second Sniper Policy
+- `--entry-confirmation-sec 15` — continuous-qualification window (0 disable)
+- `--entry-score 4.0` — minimum |score| during confirmation
+- `--entry-evidence 30` — minimum evidence during confirmation
+- `--survival-check-sec 15` — one-shot MFE check after entry (0 disable)
+- `--survival-min-favor-pct 0.0001` — 0.01% MFE required to keep signal alive
+
+### Engine Overrides
+- `--strong-threshold N` — override calibrated 4.0
+- `--normal-threshold N` — override calibrated 3.0
+- `--weak-threshold N` — override calibrated 2.0
+- `--ema-alpha 0.3` — score smoothing factor
+
+### Cost Model
+- `--cost-pct 0.0006` — explicit round-trip charges (spread already modeled
+  via bid/ask executable fills)
+- `--latency-slippage-bps 0` — optional adverse latency slippage per fill
+
+### Horizons + Verdict
+- `--horizons 5,15,30,60,120,300` — comma-separated seconds
+- `--min-samples 20` — bucket needs this many samples before verdict shown
+- `--dedup-seconds 5.0` — same-state signal dedup window
+
+### Diagnostics + Reliability
+- `--diagnose` — dump first N raw WS messages to `logs/raw_ws_dump.jsonl`
+- `--dump-count 100` — how many raw messages to dump
+- `--dump-path PATH` — dump file location
+- `--stale-feed-sec 90` — auto-exit with code 75 if no ticks for this many
+  seconds during market hours (systemd `Restart=always` will restart process).
+  `--stale-feed-sec 0` disables the guard.
+- `--log-path PATH` — predictions JSONL log location
+- `--engine-demo` — run 8-scenario engine self-test and exit
+
+---
+
+## 📊 Sample EOD Report (annotated)
 
 ```
 ══════════════════════════════════════════════════════════════════════════════
-  🎯 HIT RATE BY STATE × HORIZON
+  📶 DATA FLOW QUALITY (from real-market run)
 ──────────────────────────────────────────────────────────────────────────────
-  State          Horizon    N   Hit %  NetProfit %  AvgRet %  NetEdge %  Verdict
-  ────────────────────────────────────────────────────────────────────────────
-  STRONG_LONG      30s     42   58.3%      52.4%    +0.14%    +0.08%   ✓ edge
-  STRONG_LONG      60s     42   64.3%      59.5%    +0.19%    +0.13%   ✓✓ STRONG EDGE
-  STRONG_LONG     120s     42   61.9%      54.8%    +0.22%    +0.16%   ✓✓ STRONG EDGE
-  LONG             30s    186   51.6%      43.5%    +0.03%   -0.03%   ✗ break-even
-  LONG             60s    186   53.2%      47.3%    +0.06%   +0.00%   ~ marginal
-  WEAK_LONG        60s    412   49.5%      41.7%   -0.01%   -0.07%   ✗ noise
+  Raw messages received :    288,640
+  Parsed successfully   :    288,640  (100.0%)
+  Parse failures        :          0  (0.0%)
+  Symbols with data     :         96 of 100 expected
+  Time to first tick    :        1.4 s
+──────────────────────────────────────────────────────────────────────────────
+  ✅ Data flow healthy: 288,640 valid ticks parsed.
+══════════════════════════════════════════════════════════════════════════════
+
+  📊 END-OF-DAY HIT RATE REPORT
+══════════════════════════════════════════════════════════════════════════════
+  Session duration    : 06:30:00
+  Symbols tracked     : 96
+  Total ticks         : 288,640
+  Signals computed    : 180,617
+  Signals recorded    : 3,412
+  Signals deduped     : 12,458  (same state within 5s)
+  Predictions evaluated: 20,472
+  Execution model     : bid/ask executable + 0.0600% charges + 0.00 bps/fill latency
   ...
 
+  🎯 HIT RATE BY STATE × HORIZON
+──────────────────────────────────────────────────────────────────────────────
+  Column meanings (CHARGES = 0.060% round-trip; spread via bid/ask):
+    Hit %       = % of signals that went in predicted direction
+    %AboveCost  = % of signals where profit > cost (COUNT, not amount)
+    AvgRet %    = average per-trade return BEFORE cost (small = noise)
+    NetEdge %   = average per-trade return AFTER cost (BOTTOM LINE)
+    → +ve NetEdge = profitable | -ve NetEdge = loss-making
+
+  State          Horizon    N   Hit %   %AboveCost   AvgRet %  NetEdge %  Verdict
+  ────────────────────────────────────────────────────────────────────────────
+  STRONG_LONG      15s     56   58.9%      52.7%    +0.041%   +0.031%   ✓ marginal edge
+  STRONG_LONG      30s     56   56.2%      49.1%    +0.014%   -0.046%   ✗ break-even
+  STRONG_LONG      60s     56   52.1%      41.3%    -0.006%   -0.066%   ✗ noise
+  ...
+
+  🎯 15-SECOND POLICY OUTCOME (one row per confirmed signal)
+──────────────────────────────────────────────────────────────────────────────
+  Entry confirmation : 15s continuous qualification (ON)
+  Survival exit      : 15s MFE ≥ 0.010% (ON)
+  Confirmations      : started 4,821  passed 3,412  cancelled 1,409
+  Survival check     : passed 1,205  failed 2,207
+  Policy exits       : survival 2,207  max_horizon 1,205
+
+  State          N   Hit %   AvgRet %   NetEdge %   Verdict
+  ────────────────────────────────────────────────────────────────
+  STRONG_LONG   56   64.3%   +0.089%    +0.029%    ✓ marginal edge
+  STRONG_SHORT  38   60.5%   +0.072%    +0.012%    ~ borderline
+  ────────────────────────────────────────────────────────────────
+
   📌 HONEST OVERALL VERDICT
-  ──────────────────────────────────────────────────────────────────────────
-  Total predictions evaluated: 8,432
+══════════════════════════════════════════════════════════════════════════════
+  Total predictions evaluated: 20,472
   Overall directional hit rate: 51.8%
   Overall NET profit rate: 44.2% (after 0.06% cost)
   Average net edge per signal: +0.023%
@@ -417,306 +308,406 @@ Auto-starts every trading day, auto-stops at 15:30 IST, auto-restarts on crash.
      Recommendation: Focus on STRONG_LONG/STRONG_SHORT only, or refine params.
 ```
 
-### Output Files
+**Interpretation guide:**
 
-- `logs/hit_rate_predictions.jsonl` — every evaluated prediction (audit trail)
-- `logs/hit_rate_report.txt` — comprehensive EOD text report
-
-**यह tool की USP:** अगर scanner में asli edge है, यह precisely बताएगा
-**कौन-से** state + horizon + regime + hour में। अगर edge नहीं है, तो भी honestly बताएगा।
+| `NetEdge %` | Verdict | कहा जा रहा है |
+|---|---|---|
+| `> +0.05%` and hit_rate > 55% | ✓✓ profitable | Deploy tiny capital के लिए ready |
+| `+0.01% to +0.05%` | ✓ marginal edge | और days चाहिए |
+| `-0.03% to 0%` | ~ borderline | Cost eating the edge |
+| `< -0.03%` | ✗ noise / loss | Rebuild strategy |
 
 ---
 
-## 📼 Record→Replay Workflow (Real Tick Backtesting)
+## 💾 Output Files
 
-**यह सबसे important workflow है for honest strategy validation.**
+`bash SETUP.sh` के बाद अपने-आप बनते हैं:
 
-Random-walk simulators can never replicate real NSE microstructure —
-actual spoofing, iceberg orders, institutional flow, news reactions,
-cross-symbol correlation. So the ONLY way to know if the scanner has
-real alpha is to **record live NSE data and backtest on it**.
+| File | Content |
+|---|---|
+| `logs/hit_rate_predictions.jsonl` | Every evaluated prediction (audit trail, one JSON per line) |
+| `logs/hit_rate_report.txt` | Comprehensive EOD text report (जो terminal पर print होता है) |
+| `logs/scanner.log` | System-level rotating logs (10 MB × 5 backups) |
+| `logs/scrip_master.json` | Angel One scrip master cache (24-hour TTL) |
+| `logs/raw_ws_dump.jsonl` | First N raw WS messages (only with `--diagnose`) |
 
-### Two-Tool Pipeline
+**Audit trail row example** (`hit_rate_predictions.jsonl`):
+```json
+{
+  "ts_fired": 1721544123.456,
+  "ts_evaluated": 1721544153.463,
+  "actual_horizon_s": 30.007,
+  "target_horizon_s": 30.0,
+  "symbol": "RELIANCE-EQ",
+  "state": "STRONG_LONG",
+  "score": 4.532,
+  "evidence": 81.4,
+  "regime": "N·T↑·B",
+  "hour": 10,
+  "price_at_signal": 2530.15,
+  "ltp_at_signal": 2530.10,
+  "bid_at_signal": 2530.05,
+  "ask_at_signal": 2530.15,
+  "bid_qty_at_signal": 3120,
+  "ask_qty_at_signal": 2840,
+  "spread_bps_at_signal": 3.95,
+  "price_at_horizon": 2532.80,
+  "ltp_at_horizon": 2532.85,
+  "raw_return_pct": 0.1046,
+  "directional_return_pct": 0.1046,
+  "charges_pct": 0.0601,
+  "net_return_pct": 0.0445,
+  "is_hit": true,
+  "is_net_profitable": true,
+  "timed_out": false
+}
+```
+
+---
+
+## ⚙️ `config.json` Reference
+
+Copy the template और नीचे wale 4 credentials भरो (बाकी सब defaults OK हैं):
+
+```json
+{
+    "angel_one": {
+        "api_key":     "YOUR_SMARTAPI_KEY",
+        "client_code": "A1234567",
+        "pin":         "1234",
+        "totp_secret": "JBSWY3DPEHPK3PXP"
+    },
+    "symbols": [
+        "RELIANCE-EQ", "TCS-EQ", "HDFCBANK-EQ", "INFY-EQ", "ICICIBANK-EQ",
+        "..."
+    ],
+    "scanner": {
+        "signal_dedup_seconds": 5.0,
+        "ui_refresh_ms": 500,
+        "system_log_path": "logs/scanner.log",
+        "scrip_master_cache_path": "logs/scrip_master.json",
+        "scrip_master_ttl_hours": 24
+    },
+    "engine": {
+        "history_seconds": 60,
+        "ema_alpha": 0.3,
+        "threshold_strong": 4.0,
+        "threshold_normal": 3.0,
+        "threshold_weak":   2.0,
+        "spoof_dampener_strength": 0.5,
+        "kill_switch_spread_multiplier": 3.0
+    }
+}
+```
+
+**Credentials कहाँ से मिलेगी:**
+- **api_key** — smartapi.angelbroking.com → login → My Apps → नया app बनाओ
+- **client_code** — Angel One login ID (जैसे `A1234567`)
+- **pin** — Angel One 4-digit trading MPIN
+- **totp_secret** — Google Authenticator में QR scan करते समय "Manual entry" पर
+  tap करके base32 secret copy करो (जैसे `JBSWY3DPEHPK3PXP`)
+
+**Symbols format:** Angel One convention में `SYMBOL-EQ` (जैसे `RELIANCE-EQ`)।
+
+---
+
+## 🧠 How It Works Internally (compact overview)
 
 ```
-   ┌──────────────────────────┐         ┌──────────────────────────┐
-   │  tick_recorder.py         │         │  historical_backtest.py  │
-   │  (Days 1-5, live market)  │────────►│  (Day 6+, offline)       │
-   │                           │  data/  │                          │
-   │  Angel One WebSocket      │ *.jsonl │  Read recorded ticks     │
-   │  → gzip JSONL (hourly)    │  .gz    │  → BookDynamicsEngine    │
-   │  ~500 MB/day compressed   │         │  → PaperExecutor         │
-   │                           │         │  → EOD comprehensive     │
-   │                           │         │     report               │
-   └──────────────────────────┘         └──────────────────────────┘
+Angel One SmartWebSocketV2 (SnapQuote mode, mode=3)
+        │  Level-2 Top-5 depth + LTP + total buy/sell qty
+        ▼
+AngelOneWSAdapter.parse
+        │  Bid/ask arrays + sequence_number + exchange_ts + receive_ts
+        ▼
+BookDynamicsEngine ×N (per-symbol, thread-safe RLock)
+        │
+        ├─ Validate (sequence-based dedup — NOT timestamp-only)
+        ├─ 17 Metrics compute:
+        │   • L1 / Top-5 / weighted / book-wide imbalance
+        │   • Buy/sell ROC (1s/5s/10s)
+        │   • Liquidity flow (adds vs removes)
+        │   • Aggressor ratio (tick rule, 5s)
+        │   • Mid-price ROC + LTP ROC
+        │   • Spoofing / iceberg / replenishment suspicion
+        │   • Spread / kill switch (>3× median spread)
+        ├─ Composite: weighted-avg of 8 features → [-1, +1]
+        ├─ Spoof dampener → * (1 - k * spoof_susp)
+        ├─ Scale to [-10, +10] → EMA smooth (α=0.3)
+        └─ State: STRONG_LONG (|s|≥4) / LONG (≥3) / WEAK_LONG (≥2) / NEUTRAL
+        │
+        ▼
+HitRateAnalyzer.record_signal (via LiveHitRateSession._on_tick)
+        │
+        ├─ 15s Entry Confirmation Gate (continuous qualification)
+        ├─ State filter (--strong-only / --skip-weak)
+        ├─ Dedup gate (5s same-state)
+        ├─ Cooldown gate (opt-in, default off)
+        ├─ Session phase gate (opt-in)
+        ├─ RVOL gate (opt-in)
+        ├─ Executable entry price: LONG=ask, SHORT=bid
+        └─ Add to LiveSignalMonitor + per-horizon pending buckets
+        │
+        ▼
+LiveSignalMonitor.on_tick (every subsequent tick for the symbol)
+        │
+        ├─ Update current directional return using executable exit price
+        │   (LONG exits bid, SHORT exits ask)
+        ├─ Update MFE / MAE + horizon snapshots
+        ├─ 15s Survival Exit Check (one-shot):
+        │   - If MFE ≥ 0.01% within window → PASS, keep to max horizon
+        │   - Otherwise → FAIL, close signal now @ current exit,
+        │     record in policy bucket
+        └─ Max horizon reached → close signal, record in policy bucket
+        │
+        ▼
+Multi-Dimensional Stats (thread-safe with _stats_lock)
+        │
+        ├─ state × horizon (main diagnostic)
+        ├─ state × evidence bucket (0-30 / 30-50 / 50-70 / 70+)
+        ├─ state × regime label
+        ├─ state × hour_of_day (IST)
+        ├─ state × symbol
+        └─ policy bucket (one outcome per confirmed signal)
+        │
+        ▼
+EOD Report (comprehensive text output + JSONL audit trail)
 ```
 
-### Step 1: Record Real NSE Ticks (5 trading days)
+**Thread model:** 1 worker thread (Angel One WS callback) does everything —
+parse, engine update, signal recording, monitor updates. UI thread (rich) reads
+snapshots via locks. Health thread (5s cadence) checks stale-feed and warns.
 
+**Key production feature — stale-feed auto-exit:** If WebSocket dies silently
+mid-session (network hiccup, broker-side disconnect), the health thread detects
+"no valid ticks for 90+ seconds during market hours" and requests shutdown with
+exit code 75. Systemd's `Restart=always` restarts the process. Silent-failure
+recovery without manual intervention.
+
+---
+
+## 🎓 Trader's Interpretation Guide
+
+### After 1-day diagnostic run
+- **Parse rate < 100%?** Adapter field mismatch — run with `--diagnose`, share
+  the raw dump with maintainer.
+- **`Time to first tick > 30s`?** WebSocket subscription issue or wrong market
+  hours.
+- **Zero signals with `--strong-only`?** Score threshold might be too high for
+  today's conditions. Try `--strong-threshold 3.5` for verification.
+
+### After 5-10 day sample
+Every table's **`NetEdge %`** column is the bottom line:
+
+| Net Edge | Meaning |
+|---|---|
+| `> +0.05%` and hit rate > 55% | Real edge. Deploy small capital (₹10-25K max) with proper stops. |
+| `+0.01% to +0.05%` | Marginal. Longer test (2-4 weeks). Refine gates. |
+| `-0.03% to 0%` | Break-even. Cost eating edge. Try tighter filters. |
+| `< -0.03%` | Noise / loss. **Do NOT deploy.** Fundamental rework needed. |
+
+### Common patterns worth investigating
+- **STRONG signals profitable, LONG/WEAK losses:** turn on `--strong-only`
+- **Losses concentrated in specific hour:** check hour breakdown, add
+  `--allowed-phases MORNING,AFTERNOON` to skip volatile openings
+- **Losses when regime = RANDOM:** you don't have a regime-adaptive strategy
+  yet, but you can filter — `--session-filter` at minimum
+- **High hit rate but negative net edge:** transaction costs (`--cost-pct`)
+  exceed your actual charges → recalibrate
+
+### Reality Check
+- **Renaissance Medallion Fund win rate: 50.75%.** Yet billions profit yearly.
+  It's about payoff ratio, not win rate.
+- **Retail Level-2 latency is 50-200ms** vs institutional colocation (<1ms).
+  Some signals will be "priced in" before you see them. Real for anyone not
+  colocated.
+- **SEBI 2024 report:** 90% of retail intraday traders lose money.
+  Microstructure tools do NOT change this by themselves — they measure whether
+  YOUR specific approach has edge or not.
+
+---
+
+## 🔧 Troubleshooting
+
+### `SmartApi import failed`
 ```bash
-# On your VPS, during market hours:
-tmux new -s recorder
-cd NSE-Equity-Intraday
-python3 tick_recorder.py --config config.json --output-dir data/
-# Auto-stops at 15:30 IST. Ctrl+B, D to detach.
+bash SETUP.sh --setup-only   # rebuilds venv + reinstalls smartapi-python
 ```
 
-**Output:**
-```
-data/
-├── 2026-07-22/
-│   ├── ticks_2026-07-22_09.jsonl.gz    ← 45 MB (opening)
-│   ├── ticks_2026-07-22_10.jsonl.gz    ← 38 MB
-│   ├── ...
-│   └── ticks_2026-07-22_15.jsonl.gz    ← 42 MB (closing burst)
-├── 2026-07-23/
-...
-```
-
-Total for 5 days × 100 symbols: **~2-3 GB compressed**.
-
-### Step 2: Backtest on Recorded Real Data
-
+### `venv activation failed / bin/activate missing`
 ```bash
-# Default parameters
-python3 historical_backtest.py --data-dir data/
-
-# With Phase 2 regime adaptive
-python3 historical_backtest.py --data-dir data/ --regime-adaptive
-
-# Specific symbols
-python3 historical_backtest.py --data-dir data/ --symbols RELIANCE-EQ,TCS-EQ
-
-# Specific date range
-python3 historical_backtest.py --data-dir data/ \
-    --from-date 2026-07-22 --to-date 2026-07-26
-
-# Tune parameters (multiple runs on SAME data — this is the value!)
-python3 historical_backtest.py --data-dir data/ --entry-score 3   # aggressive
-python3 historical_backtest.py --data-dir data/ --entry-score 5   # default
-python3 historical_backtest.py --data-dir data/ --entry-score 7   # conservative
+rm -rf ~/NSE-Equity-Intraday/venv   # या /root/... अगर root user
+bash SETUP.sh --setup-only
 ```
 
-You'll get the same comprehensive report as paper_trader.py, but the numbers
-are **based on real market data** — real hit rate, real edge or lack thereof.
-
-### Step 3: systemd Service (Optional but Recommended)
-
-For 24/7 recording without manual tmux management, install as systemd service:
-
+### `No symbols resolved. Check config.symbols.`
+Angel One scrip master में कुछ symbols के names बदल गए होंगे। Check करो:
 ```bash
-# Create service file:
-sudo tee /etc/systemd/system/nse-tick-recorder.service <<EOF
+python3 -c "
+import json
+data = json.load(open('logs/scrip_master.json'))
+nse_eq = [i['symbol'] for i in data if i.get('exch_seg')=='NSE' and i['symbol'].endswith('-EQ')]
+print(f'{len(nse_eq)} NSE-EQ symbols in scrip master')
+# Check specific ones from your config:
+for s in ['TATAMOTORS-EQ', 'ZOMATO-EQ', 'LTIM-EQ']:
+    print(f'  {s}: {\"found\" if s in nse_eq else \"MISSING\"}')"
+```
+
+### `Login failed`
+- Check `totp_secret` — यह base32 secret है, current TOTP code नहीं
+- Check current TOTP works: `python3 -c "import pyotp; print(pyotp.TOTP('YOUR_SECRET').now())"`
+- Angel One dashboard पर API access enabled है या नहीं
+
+### WebSocket disconnects during session
+Systemd unit `Restart=always` + `--stale-feed-sec 90` से 90s stale feed पर
+process auto-restart होगा। Manual restart:
+```bash
+bash SETUP.sh --service-stop
+bash SETUP.sh --service-start
+```
+
+### Config credentials nano में नहीं भरे
+```bash
+nano ~/NSE-Equity-Intraday/config.json   # या /root/...
+chmod 600 ~/NSE-Equity-Intraday/config.json
+bash SETUP.sh --run   # skip install, बस launch
+```
+
+### 100% parse failure at startup
+Angel One SmartAPI का message format बदल गया होगा। `--diagnose` से raw dump
+capture करो:
+```bash
+bash SETUP.sh -- --diagnose --duration-hours 0.05   # 3 min diagnostic
+cat logs/raw_ws_dump.jsonl | head -1 | python3 -m json.tool
+```
+Share `logs/raw_ws_dump.jsonl` with maintainer.
+
+---
+
+## 🛡️ Safety + Disclaimers
+
+- **यह analytical infrastructure है, investment advice नहीं।** Signal output book
+  dynamics observations हैं; profit/loss पूरी तरह आपके risk management + execution
+  पर depend करता है।
+- **कोई real order नहीं जाता।** यह पूरी तरह measurement-only tool है।
+- **SEBI compliance:** Algorithmic trading with retail brokers requires
+  disclosure. Angel One की algo trading policy check करें।
+- **Data caveats:**
+  - Angel One SnapQuote = book-update snapshots (~5-10 per second per symbol),
+    NOT true per-trade tick-by-tick
+  - Spoofing / iceberg detection uses probabilistic *_suspicion scores,
+    never guaranteed
+  - Cancel vs Execute inference is heuristic (Lee-Ready tick rule)
+- **Retail latency reality:** 50-200ms delay vs institutional colo (<1ms).
+  Some signals will be already priced-in.
+- **Fresh capital risk warning:** SEBI 2024 report — **90% of retail intraday
+  traders lose money.** Do NOT deploy capital before at least 2 weeks of
+  live paper-trading data with positive net edge across multiple sessions.
+
+---
+
+## 🧾 Technical Details (for developers)
+
+### Performance (1-core / 2 GB VPS)
+
+| Load | Throughput | Latency p50 | Latency p99 |
+|---|---:|---:|---:|
+| NSE normal (~500 tps) | ~110 tps sustained | 100 µs | 250 µs |
+| Opening burst (3000 tps) | 2900+ tps | 105 µs | 300 µs |
+
+### Sequence-Based Dedup (P0 correctness)
+
+MarketSnapshot captures:
+- `sequence_number` — Angel One's per-message ID (primary ordering key)
+- `exchange_timestamp` — broker's exchange clock (second-resolution, for audit)
+- `received_timestamp` — local receive clock (sub-second, for analytics)
+
+Engine drops updates with `sequence <= last_sequence`, EXCEPT when exchange
+time advanced substantially (reconnect / new session reset). Legacy feeds
+without sequence fall back to exact-content fingerprint + strict-less-than
+event time.
+
+**यह क्यों matter करता है:** पुराने code में `snap.timestamp <= last_ts` सिर्फ
+second-resolution timestamp check करता था — genuine same-second book updates
+drop हो रहे थे। Sequence-based ordering से यह fix हुआ।
+
+### Executable Bid/Ask Cost Model
+
+`ExecutionCostModel` shared class:
+- LONG enters at `ask`, exits at `bid` (spread crossed = real cost)
+- SHORT enters at `bid`, exits at `ask`
+- `--cost-pct` = explicit round-trip charges only (spread already captured)
+- `--latency-slippage-bps` = optional adverse adjustment per fill (default 0)
+
+पुराने code में LTP-to-LTP return minus 6 bps calculation था — spread completely
+ignore हो रहा था। अब यह fix है।
+
+### Systemd Unit (auto-generated)
+
+```ini
 [Unit]
-Description=NSE Tick Recorder (Angel One SnapQuote Capture)
+Description=NSE Live Hit Rate Analyzer
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=${USER}
-WorkingDirectory=/home/${USER}/NSE-Equity-Intraday
-Environment=PATH=/home/${USER}/NSE-Equity-Intraday/venv/bin:/usr/bin
-ExecStart=/home/${USER}/NSE-Equity-Intraday/venv/bin/python3 \\
-    /home/${USER}/NSE-Equity-Intraday/tick_recorder.py \\
-    --config /home/${USER}/NSE-Equity-Intraday/config.json \\
-    --output-dir /home/${USER}/nse_data
-Restart=on-failure
-RestartSec=30
-StandardOutput=journal
-StandardError=journal
+User=root
+WorkingDirectory=/root/NSE-Equity-Intraday
+Environment="PATH=/root/NSE-Equity-Intraday/venv/bin:/usr/local/bin:/usr/bin:/bin"
+
+ExecStart=/root/NSE-Equity-Intraday/venv/bin/python3 \
+    /root/NSE-Equity-Intraday/live_hit_rate_analyzer.py \
+    --config /root/NSE-Equity-Intraday/config.json \
+    --duration-hours 6.5 --no-ui \
+    --strong-only \
+    --entry-confirmation-sec 15 --entry-score 4.0 --entry-evidence 30 \
+    --survival-check-sec 15 --survival-min-favor-pct 0.0001 \
+    --stale-feed-sec 90 \
+    --log-path /root/NSE-Equity-Intraday/logs/hit_rate_predictions.jsonl \
+    --report-path /root/NSE-Equity-Intraday/logs/hit_rate_report.txt
+
+Restart=always
+RestartSec=60
+LimitNOFILE=65536
+MemoryMax=1G
 
 [Install]
 WantedBy=multi-user.target
-EOF
-
-# Enable + start:
-sudo systemctl daemon-reload
-sudo systemctl enable nse-tick-recorder
-sudo systemctl start nse-tick-recorder
-
-# Monitor:
-journalctl -u nse-tick-recorder -f
 ```
 
-Recorder will now start automatically on VPS boot and restart on any crash.
-Auto-stops at 15:30 IST daily; will restart next morning if VPS is on.
+### Requirements
 
-### Why This Approach is Right
-
-| | Random Simulator | **Real Recorded Ticks** |
-|---|---|---|
-| Order flow intent | Fake (RNG) | **Real (institutional + retail)** |
-| Spoofing patterns | None | **Actual operator behavior** |
-| Iceberg orders | Fake | **Real hidden liquidity** |
-| News reactions | None | **Real fat-tail moves** |
-| Time-of-day effects | Approximated | **Genuine microstructure** |
-| Cross-symbol correlation | Zero | **Real Nifty gravity** |
-| **Backtest validity** | **Illusion** | **Ground truth** |
-
-### 🔄 The Real Iteration Loop
-
+Python 3.9+ (tested on 3.10, 3.11, 3.12):
 ```
-1. Record 5 days of real data (once)
-2. Try 20 different parameter combos in 1 hour  ← THIS is the payoff
-3. Compare results side-by-side
-4. Best config → paper trade with --feed live for 5 more days
-5. If STILL profitable → very small real capital (₹10K max)
-6. Scale slowly only after multi-week validation
+smartapi-python>=1.4.0
+websocket-client>=1.6.0
+pyotp>=2.9.0
+requests>=2.31.0
+rich>=13.0.0
 ```
-
----
-
-## 🎯 How to Test on Real Data (Live Paper Trading)
-
-The realistic simulator is our best offline approximation of NSE, but only
-real data can prove/disprove profitability. Here's how:
-
-### Prerequisites
-
-1. Angel One SmartAPI account with API key + TOTP secret
-2. VPS with 1+ vCPU, 2GB+ RAM in Mumbai region (for lowest latency)
-3. Python 3.9+ and dependencies installed
-
-### Live Paper Trading Setup
-
-```bash
-# 1. Deploy on VPS
-git clone https://github.com/baldaurathore92-svg/NSE-Equity-Intraday.git
-cd NSE-Equity-Intraday
-./deploy_vps.sh   # installs deps, sets timezone, etc.
-
-# 2. Configure credentials
-cp config.example.json config.json
-chmod 600 config.json
-nano config.json   # fill Angel One api_key, client_code, pin, totp_secret
-
-# 3. Start LIVE paper trading (during 9:15-15:30 IST)
-python3 paper_trader.py --feed live --config config.json \
-    --duration-min 390 --regime-adaptive
-
-# Or run in background (tmux) for full trading day:
-tmux new -s paper
-python3 paper_trader.py --feed live --config config.json --duration-min 390 --regime-adaptive
-# Ctrl+B, then D to detach. tmux attach -t paper to reattach.
-```
-
-### What You'll See in the EOD Report
-
-After 6.5 hours of real NSE ticks:
-- Total trades executed (virtual — no real orders placed)
-- Actual hit rate on REAL market data
-- Real signal→price attribution (was scanner right or wrong?)
-- Regime distribution (what NSE actually looks like today)
-- Per-state performance breakdown
-- Comprehensive HONEST verdict (STRONG / MARGINAL / BREAKEVEN / LOSING)
-
-### Interpretation Framework
-
-After 5-10 trading days of live paper trading:
-
-| Result | Meaning | Action |
-|--------|---------|--------|
-| Win rate < 45% | No edge. Realistic. | Do NOT deploy real money. Rebuild strategy. |
-| Win rate 45-52% | Break-even before costs. | Improve signal quality (Phase 3/4). |
-| Win rate 52-58% | Marginal edge exists. | Refine risk management, then test with small capital. |
-| Win rate > 58% | Statistically likely real edge. | Cautiously deploy small capital, keep expanding paper set. |
-
-**Remember:** Even with real edge, retail Level-2 feed has 50-200ms latency vs
-institutional colo (<1ms). Some signals will already be "priced in" by the time
-you see them.
-
----
-
-## 🛡️ Safety Features
-
-- **Kill switch** — Auto-suppress on spread widening > 3× median
-- **Circuit filter detection** — Auto-suppress at upper/lower circuit
-- **Signal deduplication** — Same state within 5s not repeated
-- **Backpressure counter** — Alerts if worker falling behind WS
-- **Rate limiting** — Log throttling to avoid disk spam
-- **Rotating logs** — 10 MB × 5 backups
-
----
-
-## 📋 Configuration Reference
-
-`config.json` में तीन sections:
-
-### `angel_one` — Broker credentials
-```json
-"angel_one": {
-    "api_key":     "YOUR_SMARTAPI_KEY",
-    "client_code": "YOUR_CLIENT_CODE",
-    "pin":         "YOUR_4_DIGIT_MPIN",
-    "totp_secret": "YOUR_BASE32_TOTP_SECRET"
-}
-```
-
-### `scanner` — Runtime behavior
-```json
-"scanner": {
-    "min_evidence_strength_to_log": 30,
-    "log_signal_states": ["WEAK_LONG", "LONG", "STRONG_LONG",
-                          "WEAK_SHORT", "SHORT", "STRONG_SHORT"],
-    "signal_dedup_seconds": 5.0,
-    "ui_refresh_ms": 500,
-    "top_n_display": 10,
-    "tick_queue_size": 20000
-}
-```
-
-### `engine` — BookDynamicsEngine tuning
-```json
-"engine": {
-    "history_seconds": 15,
-    "depth_decay_frac": 0.005,
-    "ema_alpha": 0.3,
-    "threshold_strong": 8.0,
-    "threshold_normal": 5.0,
-    "threshold_weak": 2.0,
-    "spoof_dampener_strength": 0.5,
-    "kill_switch_spread_multiplier": 3.0
-}
-```
-
----
-
-## 🗂️ Repository Structure
-
-```
-NSE-Equity-Intraday/
-├── nse_book_scanner.py       (Main scanner — engine + scanner + UI, 2,588 lines)
-├── config.example.json       (Config template with Nifty 100 symbols)
-├── requirements.txt          (Python dependencies)
-├── deploy_vps.sh             (One-command VPS auto-installer)
-├── install_service.sh        (Systemd auto-restart service)
-├── .gitignore                (Sensitive files excluded)
-└── README.md                 (This file)
-```
-
----
-
-## ⚠️ Important Disclaimers
-
-- **This is analytical infrastructure, not investment advice.** Signal output represents book dynamics observations; profit/loss depends entirely on your risk management and execution strategy.
-- **Paper trade first.** Run in `--mode simulate` for at least 2-4 weeks before real capital.
-- **SEBI compliance:** Algorithmic trading with retail brokers requires disclosure. Check Angel One's algo trading policy.
-- **Data caveats:**
-  - Angel One SnapQuote = book-update snapshots, NOT true per-trade tick-by-tick
-  - Spoofing/iceberg detection uses probabilistic *_suspicion scores, never guaranteed
-  - Cancel vs Execute inference is heuristic (Lee-Ready tick rule)
 
 ---
 
 ## 📜 License
 
-MIT — for the user's own trading system। Attribution appreciated but not required.
+MIT — for your own trading system. Attribution appreciated but not required.
 
 ---
 
-## 🙏 Credits
+## 🙏 Credits + Design Notes
 
-Designed collaboratively — critical review + implementation + optimization iterations across:
-- Order-flow theory (17 microstructure metrics)
-- Production infrastructure (producer-consumer queue, systemd, VPS deployment)
-- Performance tuning (bisect-based history, batched pruning, cached medians)
+Designed collaboratively with iterative review across:
+- Order-flow theory (17 microstructure metrics from academic literature)
+- Production infrastructure (single-file architecture, systemd auto-restart,
+  stale-feed guard, sequence-based dedup)
+- Trader-level pragmatism (Gemini's "Sniper Bot" 15-second policy, calibrated
+  thresholds from 67k+ live signals, executable bid/ask cost model)
+
+**Non-goals (deliberately excluded):**
+- ML/AI models (LSTM, transformers) — keep math simple + interpretable
+- Multiple broker support — Angel One only
+- Web dashboard — terminal + JSONL sufficient
+- Slack/Telegram alerts — standalone
+- Options / futures — Cash Equity only
+- Real order routing — this is measurement, not trading
