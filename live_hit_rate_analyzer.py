@@ -692,7 +692,12 @@ class BookMetrics:
     cancellation_suspicion_ask: float = 0.0
     cancellation_suspicion_bid: float = 0.0
     spoofing_suspicion:        float = 0.0   # dampens composite score
-    iceberg_suspicion:         float = 0.0   # hidden liquidity refill signature
+    iceberg_suspicion:         float = 0.0   # hidden liquidity refill signature (magnitude)
+    # Direction of the strongest detected iceberg:
+    #   "bid"  → hidden BUYING pressure (bullish, feeds LONG composite)
+    #   "ask"  → hidden SELLING pressure (bearish, feeds SHORT composite)
+    #   ""     → no iceberg detected yet (magnitude will also be 0)
+    iceberg_side:              str   = ""
     replenishment_score:       float = 0.0
 
     # ---- Phase 2 — market regime tag (per-symbol, updated batched) ----
@@ -948,6 +953,11 @@ class EngineConfig:
     w_liquidity_flow:      float = 1.5
     w_aggressor_ratio:     float = 2.0
     w_mid_response:        float = 1.5
+    # -- Iceberg (previously computed but ignored by composite) --
+    # Default 0.0 preserves backwards compat. Real refills-with-executions
+    # signal is high-conviction directional; suggested value once you've
+    # eyeballed live iceberg firings for your symbol set: 1.0 - 1.5.
+    w_iceberg:             float = 0.0
 
     # -- Spoof-suspicion dampener --
     # Spoof suspicion reduces our CONVICTION in a signal (|score|) but
@@ -962,6 +972,14 @@ class EngineConfig:
     # α = 0.3 is a common "short-memory" setting that reacts within
     # ~3-4 ticks yet still filters out single-tick noise spikes.
     ema_alpha: float = 0.3
+
+    # -- EMA warm-up guard (fixes user-reported "Cold Start Trap") --
+    # The old implementation seeded the EMA with the FIRST raw_score,
+    # so a random noise tick at 9:15:00.001 would pin the EMA for the
+    # next 2-3 minutes. Now the EMA is seeded at 0.0 (neutral) and a
+    # configurable warm-up period suppresses signals until the EMA has
+    # actually converged. 50 ticks ≈ 10 seconds at 5 tps.
+    ema_warmup_ticks: int = 50
 
     # -- Signal-state thresholds on smoothed_score in [-10, +10] --
     # ⚠ EMPIRICAL CALIBRATION (from 67k+ live NSE signals):
@@ -1065,6 +1083,12 @@ class BookDynamicsEngine:
         # -- EMA state for the composite score --
         # None until the first computed raw_score; then updates in-place.
         self._ema_score: Optional[float] = None
+        # Warm-up counter: signals are suppressed for the first
+        # `ema_warmup_ticks` ticks so the EMA can converge past its
+        # zero seed before we act on it. Fixes the "9:15 AM Cold Start
+        # Trap" the user reported (a single noise tick pinning the EMA
+        # for 2-3 minutes at market open).
+        self._warmup_ticks: int = 0
 
         # -- Iceberg / level-behaviour tracker --
         # Keyed by (side, price_key). Each value records the level's
@@ -1191,6 +1215,7 @@ class BookDynamicsEngine:
             self._iceberg_prune_counter = 0
             self._pull_events.clear()
             self._ema_score = None
+            self._warmup_ticks = 0
             self._last_ts = -1.0
             self._last_sequence = None
             self._last_exchange_ts = None
@@ -1735,8 +1760,13 @@ class BookDynamicsEngine:
                     candidates.discard(k)
 
         # -- Scoring: iterate ONLY candidates (small set, not all tracked) --
+        # Track the winning iceberg's SIDE so downstream composite scoring
+        # can turn it into a directional feature (bid → bullish LONG,
+        # ask → bearish SHORT). Previously we returned only a magnitude
+        # and ignored side, which made the whole feature dead code.
         best_score = 0.0
         best_refills = 0
+        best_side = ""
         for key in list(candidates):
             info = tracker.get(key)
             if info is None:
@@ -1753,8 +1783,11 @@ class BookDynamicsEngine:
             if score > best_score:
                 best_score = score
                 best_refills = r
+                # Key is (side, price_key) — first element is "bid"/"ask"
+                best_side = key[0]
 
         m.iceberg_suspicion = best_score
+        m.iceberg_side = best_side
         m.replenishment_score = 1.0 if best_refills >= 5 else best_refills * 0.2
 
     # ================================================================
@@ -1814,6 +1847,19 @@ class BookDynamicsEngine:
         # Mid-price 5s response: ±1% move → tanh(1)
         f_mid = tanh_scale(m.mid_price_roc_5s * 100.0, k=1.0)
 
+        # Iceberg — was dead code before (magnitude computed but not fed
+        # into any downstream signal). Now converted to a signed feature:
+        #   +suspicion   when the strongest iceberg is on the BID side
+        #                (hidden buying pressure → bullish → contributes LONG)
+        #   -suspicion   when on the ASK side (hidden selling → bearish)
+        #   0            when no iceberg detected
+        if m.iceberg_side == "bid":
+            f_ice =  clamp(m.iceberg_suspicion, -1, 1)
+        elif m.iceberg_side == "ask":
+            f_ice = -clamp(m.iceberg_suspicion, -1, 1)
+        else:
+            f_ice = 0.0
+
         weighted = [
             (cfg.w_l1_imbalance,        f_l1,   "L1"),
             (cfg.w_top5_imbalance,      f_t5,   "Top5"),
@@ -1823,6 +1869,7 @@ class BookDynamicsEngine:
             (cfg.w_liquidity_flow,      f_flow, "LiqFlow"),
             (cfg.w_aggressor_ratio,     f_agg,  "Aggressor5s"),
             (cfg.w_mid_response,        f_mid,  "MidROC5s"),
+            (cfg.w_iceberg,             f_ice,  "Iceberg"),
         ]
         w_sum = sum(w for w, _, _ in weighted)
         raw_norm = safe_div(sum(w * v for w, v, _ in weighted), w_sum)  # in [-1, +1]
@@ -1834,13 +1881,18 @@ class BookDynamicsEngine:
         # Scale to [-10, +10]
         raw_score = clamp(adjusted * 10.0, -10.0, 10.0)
 
-        # EMA smoothing
+        # EMA smoothing — seed at 0.0 (neutral), NOT at first raw_score.
+        # The old "self._ema_score = raw_score" seed let a single noise tick
+        # at market open pin the EMA far from centre for the next 2-3 min.
+        # See EngineConfig.ema_warmup_ticks docstring for background.
         if self._ema_score is None:
-            self._ema_score = raw_score
-        else:
-            a = cfg.ema_alpha
-            self._ema_score = a * raw_score + (1.0 - a) * self._ema_score
+            self._ema_score = 0.0
+        a = cfg.ema_alpha
+        self._ema_score = a * raw_score + (1.0 - a) * self._ema_score
         smoothed = self._ema_score
+
+        # Track ticks-since-startup for the warm-up gate applied below.
+        self._warmup_ticks += 1
 
         # =====================================================
         # REGIME GATE (opt-in via EngineConfig.regime_gate_enabled) --
@@ -1875,11 +1927,26 @@ class BookDynamicsEngine:
         # State mapping
         state = self._score_to_state(smoothed)
 
+        # -- EMA WARM-UP GATE --
+        # Suppress signals until the EMA has processed enough ticks to
+        # actually reflect recent flow rather than the neutral zero seed.
+        # This fixes the "9:15 AM Cold Start" failure mode where a single
+        # noise tick used to hijack the EMA for the first 2-3 minutes.
+        if self._warmup_ticks < cfg.ema_warmup_ticks:
+            state = SignalState.NEUTRAL
+            warmup_note = (
+                f"EMA warm-up: {self._warmup_ticks}/{cfg.ema_warmup_ticks} ticks"
+            )
+        else:
+            warmup_note = None
+
         # Evidence strength = |score| * agreement factor
         agreement = self._agreement_ratio(weighted, smoothed)
         evidence = clamp(abs(smoothed) * (0.5 + 0.5 * agreement) * 10.0, 0.0, 100.0)
 
         reasons = self._compose_reasons(m, weighted, smoothed, agreement)
+        if warmup_note is not None:
+            reasons.insert(0, warmup_note)
         if regime_note is not None:
             reasons.insert(0, regime_note)
 
@@ -6638,6 +6705,34 @@ Examples:
                         "(default: 3.0). Set 2.0 for tighter fast-market "
                         "protection.")
 
+    # -- Weight overrides (address user's Scan 2 concerns about specific
+    #    features being susceptible to spoofing / dead code / etc). --
+    p.add_argument("--w-book-wide", type=float, default=None,
+                   help="Weight for book_wide_imbalance feature (default 1.0). "
+                        "Set to 0.0 if you believe your symbols' deep-book "
+                        "imbalances are being spoofed.")
+    p.add_argument("--w-aggressor", type=float, default=None,
+                   help="Weight for buyer_aggressor_ratio_5s feature "
+                        "(default 2.0). Tick-rule accuracy is ~65-75%%; "
+                        "lower to 1.0 or 0.5 if your data proves it's noisy.")
+    p.add_argument("--w-iceberg", type=float, default=None,
+                   help="Weight for iceberg feature (default 0.0). Set 1.0 "
+                        "to include hidden-liquidity signal in composite. "
+                        "Previously dead code before this commit.")
+
+    # -- EMA warm-up (Cold-Start Trap fix) --
+    p.add_argument("--ema-warmup-ticks", type=int, default=None,
+                   help="Suppress signals for the first N ticks so the EMA "
+                        "can converge past its neutral seed (default 50 ≈ "
+                        "10s at 5 tps). Set 0 to disable warm-up.")
+
+    # -- Iceberg detection window (sweep-blindness concern) --
+    p.add_argument("--iceberg-hold-bps", type=float, default=None,
+                   help="±bps window around a tracked level within which a "
+                        "trade counts as 'near' the iceberg (default 5.0). "
+                        "Widen to 10.0 to catch fast sweeps that jump "
+                        "multiple ticks in one event.")
+
     # -- Signal state filter (which states to record) --
     p.add_argument("--strong-only", action="store_true",
                    help="Record ONLY STRONG_LONG + STRONG_SHORT signals. "
@@ -6896,6 +6991,22 @@ def main() -> int:
     if args.kill_switch_spread_mult is not None:
         engine_config.kill_switch_spread_multiplier = args.kill_switch_spread_mult
         threshold_overrides.append(f"kill_switch_mult={args.kill_switch_spread_mult}")
+    # Feature-weight overrides (address specific user concerns per feature)
+    if args.w_book_wide is not None:
+        engine_config.w_book_wide_imbalance = args.w_book_wide
+        threshold_overrides.append(f"w_book_wide={args.w_book_wide}")
+    if args.w_aggressor is not None:
+        engine_config.w_aggressor_ratio = args.w_aggressor
+        threshold_overrides.append(f"w_aggressor={args.w_aggressor}")
+    if args.w_iceberg is not None:
+        engine_config.w_iceberg = args.w_iceberg
+        threshold_overrides.append(f"w_iceberg={args.w_iceberg}")
+    if args.ema_warmup_ticks is not None:
+        engine_config.ema_warmup_ticks = args.ema_warmup_ticks
+        threshold_overrides.append(f"ema_warmup={args.ema_warmup_ticks}")
+    if args.iceberg_hold_bps is not None:
+        engine_config.iceberg_price_hold_bps = args.iceberg_hold_bps
+        threshold_overrides.append(f"iceberg_hold_bps={args.iceberg_hold_bps}")
         threshold_overrides.append(f"ema_alpha={args.ema_alpha}")
 
     logger.info(f"  Score thresholds: STRONG≥{engine_config.threshold_strong}, "
