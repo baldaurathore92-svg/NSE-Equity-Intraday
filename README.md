@@ -17,9 +17,25 @@
 
 - `live_hit_rate_analyzer.py` — SINGLE Python file (~5,800 lines): engine + Angel One WS adapter + session/RVOL gates + HitRateAnalyzer + CLI + rich UI
 - `config.json` (user creates from `config.example.json`)
-- `SETUP.sh` — one-command install + launch
+- `SETUP.sh` — SINGLE shell file: install + run + systemd service (सारे modes flags पर)
 
-Engine self-test किसी भी config के बिना: `python3 live_hit_rate_analyzer.py --engine-demo`
+### `SETUP.sh` modes
+
+```bash
+bash SETUP.sh                    # install + 15-min diagnostic (default)
+bash SETUP.sh --full             # install + 6.5-hour full trading day
+bash SETUP.sh --duration N       # install + N-hour custom run
+bash SETUP.sh --setup-only       # install only, don't launch analyzer
+bash SETUP.sh --run              # skip install, just launch (env must be ready)
+bash SETUP.sh --engine-demo      # 8-scenario engine self-test (no config)
+bash SETUP.sh --install-service  # register systemd unit + auto-start on VPS
+bash SETUP.sh --service-status   # systemctl status
+bash SETUP.sh --service-logs     # journalctl -f
+bash SETUP.sh --service-start    # systemctl start
+bash SETUP.sh --service-stop     # systemctl stop
+bash SETUP.sh --uninstall-service # remove systemd unit
+bash SETUP.sh --help             # show all modes
+```
 
 ### One-command run
 
@@ -367,9 +383,9 @@ python3 live_hit_rate_analyzer.py --config config.json --cost-pct 0.001
 ### 24/7 systemd Service (VPS)
 
 ```bash
-./install_hitrate_service.sh
-sudo systemctl start nse-hitrate-analyzer
-journalctl -u nse-hitrate-analyzer -f
+bash SETUP.sh --install-service
+bash SETUP.sh --service-start
+bash SETUP.sh --service-logs
 ```
 
 Auto-starts every trading day, auto-stops at 15:30 IST, auto-restarts on crash.
