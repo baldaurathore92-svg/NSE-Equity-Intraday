@@ -115,9 +115,11 @@ class MarketSnapshot:
     Requirements:
       - `bids` sorted best-first (highest bid price पहले)
       - `asks` sorted best-first (lowest ask price पहले)
-      - `timestamp` monotonically non-decreasing (out-of-order dropped by engine)
+      - `timestamp` is the local receive/event clock used for analytics
+      - `exchange_timestamp` preserves the broker exchange clock for audit
+      - `sequence_number` is the primary ordering/dedup key when available
     """
-    timestamp: float                 # epoch seconds (sub-second precision preferred)
+    timestamp: float                 # event epoch seconds (receive clock preferred)
     symbol: str
     ltp: float                       # last traded price
     ltq: int                         # last traded qty (optional, 0 OK)
@@ -126,6 +128,11 @@ class MarketSnapshot:
     total_sell_qty: int              # exchange-broadcast aggregate BOOK-WIDE
     bids: List[DepthLevel]           # top-N (typically 5), best-first
     asks: List[DepthLevel]           # top-N (typically 5), best-first
+
+    # Market-data identity / clocks. Existing simulator callers can omit these.
+    sequence_number: Optional[int] = None
+    exchange_timestamp: Optional[float] = None
+    received_timestamp: Optional[float] = None
 
     # Optional / informational
     open_price:       Optional[float] = None
@@ -162,6 +169,75 @@ class MarketSnapshot:
         if self.best_bid is None or self.best_ask is None:
             return None
         return self.best_ask - self.best_bid
+
+
+@dataclass(frozen=True)
+class ExecutionCostModel:
+    """
+    Shared executable-fill and cost model used by hit-rate and paper trading.
+
+    Spread crossing is captured by bid/ask fills. `transaction_cost_pct` is
+    reserved for explicit round-trip charges, while `latency_slippage_bps` is
+    an optional, separately visible adverse adjustment per fill.
+    """
+    transaction_cost_pct: float = 0.0006
+    latency_slippage_bps: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.transaction_cost_pct < 0:
+            raise ValueError("transaction_cost_pct cannot be negative")
+        if self.latency_slippage_bps < 0:
+            raise ValueError("latency_slippage_bps cannot be negative")
+
+    def fill_price(
+        self,
+        side: str,
+        is_entry: bool,
+        ltp: float,
+        best_bid: Optional[float],
+        best_ask: Optional[float],
+    ) -> float:
+        """Return executable quote plus optional adverse latency slippage."""
+        side = side.upper()
+        if side not in {"LONG", "SHORT"}:
+            raise ValueError(f"Unsupported side: {side}")
+
+        is_buy = (side == "LONG" and is_entry) or (side == "SHORT" and not is_entry)
+        quote = best_ask if is_buy else best_bid
+        if quote is None or quote <= 0:
+            quote = ltp
+        if quote is None or quote <= 0:
+            raise ValueError("No positive executable quote or LTP")
+
+        slip = self.latency_slippage_bps / 10000.0
+        return quote * (1.0 + slip if is_buy else 1.0 - slip)
+
+    @staticmethod
+    def gross_directional_return(side: str, entry_price: float, exit_price: float) -> float:
+        if entry_price <= 0:
+            return 0.0
+        if side.upper() == "SHORT":
+            return (entry_price - exit_price) / entry_price
+        return (exit_price - entry_price) / entry_price
+
+    def charge_return(self, entry_price: float, exit_price: float) -> float:
+        """Round-trip charges as a return on entry notional."""
+        if entry_price <= 0:
+            return 0.0
+        avg_price = (entry_price + exit_price) / 2.0
+        return self.transaction_cost_pct * avg_price / entry_price
+
+    def evaluate(self, side: str, entry_price: float, exit_price: float) -> Tuple[float, float, float]:
+        """Return (gross executable return, charge return, net return)."""
+        gross = self.gross_directional_return(side, entry_price, exit_price)
+        charges = self.charge_return(entry_price, exit_price)
+        return gross, charges, gross - charges
+
+    def description(self) -> str:
+        return (
+            f"bid/ask executable + {self.transaction_cost_pct * 100:.4f}% charges"
+            f" + {self.latency_slippage_bps:.2f} bps/fill latency"
+        )
 
 
 @dataclass
@@ -634,8 +710,12 @@ class BookDynamicsEngine:
         self._sell_vol_5s  = TimeSeriesBuffer(5.0)
         self._last_agg_side: AggressorSide = AggressorSide.NA
 
-        # Sequence guard
+        # Market-data ordering guard. Sequence is authoritative when supplied;
+        # receive/event time is only the fallback for legacy/simulated feeds.
         self._last_ts: float = -1.0
+        self._last_sequence: Optional[int] = None
+        self._last_exchange_ts: Optional[float] = None
+        self._last_fingerprint: Optional[Tuple[Any, ...]] = None
 
     # ================================================================
     # Public API
@@ -662,6 +742,10 @@ class BookDynamicsEngine:
                 self._last_spread_sample_ts = snap.timestamp
                 self._median_dirty = True
             self._last_ts = snap.timestamp
+            self._last_sequence = snap.sequence_number
+            if snap.exchange_timestamp is not None:
+                self._last_exchange_ts = snap.exchange_timestamp
+            self._last_fingerprint = self._snapshot_fingerprint(snap)
 
             return signal
 
@@ -680,22 +764,63 @@ class BookDynamicsEngine:
             self._pull_events.clear()
             self._ema_score = None
             self._last_ts = -1.0
+            self._last_sequence = None
+            self._last_exchange_ts = None
+            self._last_fingerprint = None
             self._last_agg_side = AggressorSide.NA
 
     # ================================================================
     # Validation
     # ================================================================
 
+    @staticmethod
+    def _snapshot_fingerprint(snap: MarketSnapshot) -> Tuple[Any, ...]:
+        """Fallback identity for legacy feeds that do not provide a sequence."""
+        return (
+            snap.ltp, snap.ltq, snap.volume_traded,
+            snap.total_buy_qty, snap.total_sell_qty,
+            tuple((lv.price, lv.quantity) for lv in snap.bids),
+            tuple((lv.price, lv.quantity) for lv in snap.asks),
+        )
+
     def _validate(self, snap: MarketSnapshot) -> bool:
-        if snap.timestamp <= self._last_ts:
-            # Angel One sends same-timestamp snapshots multiple times per second
-            # (WebSocket redundancy). Dedup is working correctly — this is normal
-            # market behavior. DEBUG level to keep terminal clean.
-            logger.debug(
-                "Duplicate snapshot ts=%.6f (last=%.6f); dropping",
-                snap.timestamp, self._last_ts,
-            )
-            return False
+        sequence = snap.sequence_number
+        if sequence is not None and self._last_sequence is not None:
+            if sequence <= self._last_sequence:
+                # A reconnect/session can reset the broker sequence. Only accept
+                # that reset when exchange time moved forward substantially;
+                # otherwise this is duplicate/out-of-order delivery.
+                exchange_advanced = (
+                    sequence < self._last_sequence
+                    and snap.exchange_timestamp is not None
+                    and self._last_exchange_ts is not None
+                    and snap.exchange_timestamp > self._last_exchange_ts + 30.0
+                )
+                if exchange_advanced:
+                    logger.info(
+                        "Sequence reset detected for %s: %s -> %s",
+                        snap.symbol, self._last_sequence, sequence,
+                    )
+                else:
+                    logger.debug(
+                        "Duplicate/out-of-order sequence for %s: seq=%s last=%s; dropping",
+                        snap.symbol, sequence, self._last_sequence,
+                    )
+                    return False
+        elif sequence is None:
+            fingerprint = self._snapshot_fingerprint(snap)
+            if fingerprint == self._last_fingerprint:
+                logger.debug(
+                    "Exact duplicate snapshot without sequence for %s; dropping",
+                    snap.symbol,
+                )
+                return False
+            if snap.timestamp < self._last_ts:
+                logger.debug(
+                    "Out-of-order event time for %s: ts=%.6f last=%.6f; dropping",
+                    snap.symbol, snap.timestamp, self._last_ts,
+                )
+                return False
         if not snap.bids or not snap.asks:
             logger.warning("Empty depth for %s @ %.6f", snap.symbol, snap.timestamp)
             return False
@@ -1821,7 +1946,10 @@ class PendingPrediction:
     state: str                # SignalState.value (e.g. "STRONG_LONG")
     score: float              # smoothed_score at fire time
     evidence: float           # evidence_strength at fire time
-    price_at_signal: float    # LTP जब signal fire हुआ
+    price_at_signal: float    # executable entry fill (ask LONG / bid SHORT)
+    ltp_at_signal: float
+    best_bid_at_signal: float
+    best_ask_at_signal: float
     ts_fired: float           # timestamp when signal fired (from tick)
     horizon_seconds: float    # कब evaluate करना है (fire + horizon)
 
@@ -1903,7 +2031,11 @@ class PredictionTracker:
         max_pending_age_s: float = 300.0,
     ):
         self.horizons = sorted(float(h) for h in horizons_s)
-        self.cost = float(transaction_cost_pct)
+        self.execution_model = ExecutionCostModel(
+            transaction_cost_pct=float(transaction_cost_pct),
+            latency_slippage_bps=0.0,
+        )
+        self.cost = self.execution_model.transaction_cost_pct
         self.log_path = Path(log_path)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.max_pending_age = float(max_pending_age_s)
@@ -1945,23 +2077,37 @@ class PredictionTracker:
     def record_signal(
         self, symbol: str, state: str, score: float, evidence: float,
         price: float, ts: float,
+        best_bid: Optional[float] = None,
+        best_ask: Optional[float] = None,
     ) -> None:
-        """Actionable signal fire होते ही हर horizon पर एक pending बनाओ।"""
+        """Actionable signal पर executable entry से pending बनाओ।"""
         if state not in _ACTIONABLE_STATES:
             return
         if price <= 0:
             return
+        side = "SHORT" if state in _SHORT_STATES else "LONG"
+        entry_price = self.execution_model.fill_price(
+            side, True, price, best_bid, best_ask,
+        )
         bucket = self._pending.setdefault(symbol, deque())
         for h in self.horizons:
             bucket.append(PendingPrediction(
                 symbol=symbol, state=state, score=score, evidence=evidence,
-                price_at_signal=price, ts_fired=ts, horizon_seconds=h,
+                price_at_signal=entry_price,
+                ltp_at_signal=price,
+                best_bid_at_signal=float(best_bid or 0.0),
+                best_ask_at_signal=float(best_ask or 0.0),
+                ts_fired=ts, horizon_seconds=h,
             ))
         self.signals_recorded += 1
 
     # -- Evaluation (called from worker thread on every tick) --
 
-    def on_tick(self, symbol: str, current_price: float, current_ts: float) -> None:
+    def on_tick(
+        self, symbol: str, current_price: float, current_ts: float,
+        best_bid: Optional[float] = None,
+        best_ask: Optional[float] = None,
+    ) -> None:
         """
         Symbol के pending predictions में से जो horizon पार कर चुके हैं उन्हें
         evaluate करो। बाकियों को छोड़ दो।
@@ -1978,11 +2124,17 @@ class PredictionTracker:
             age = current_ts - pred.ts_fired
             if age >= pred.horizon_seconds:
                 # Horizon पूरा हुआ — evaluate
-                self._evaluate(pred, current_price, current_ts, timed_out=False)
+                self._evaluate(
+                    pred, current_price, current_ts, timed_out=False,
+                    best_bid=best_bid, best_ask=best_ask,
+                )
                 ready_indices.append(i)
             elif age > self.max_pending_age:
                 # बहुत ज्यादा purani — force close (feed lag या symbol stopped)
-                self._evaluate(pred, current_price, current_ts, timed_out=True)
+                self._evaluate(
+                    pred, current_price, current_ts, timed_out=True,
+                    best_bid=best_bid, best_ask=best_ask,
+                )
                 ready_indices.append(i)
 
         if not ready_indices:
@@ -1999,23 +2151,24 @@ class PredictionTracker:
     def _evaluate(
         self, pred: PendingPrediction, current_price: float,
         current_ts: float, timed_out: bool,
+        best_bid: Optional[float] = None,
+        best_ask: Optional[float] = None,
     ) -> None:
-        """Evaluate a single expired prediction; update stats + log."""
-        # Raw return: unsigned percentage change from signal price
-        raw_return = (current_price - pred.price_at_signal) / pred.price_at_signal
-
-        # Directional return: sign-flipped for SHORT states so "positive" always
-        # means "signal was correct"
-        if pred.state in _SHORT_STATES:
-            directional_return = -raw_return
-        else:
-            directional_return = raw_return
+        """Evaluate one prediction at the executable exit quote."""
+        side = "SHORT" if pred.state in _SHORT_STATES else "LONG"
+        exit_price = self.execution_model.fill_price(
+            side, False, current_price, best_bid, best_ask,
+        )
+        directional_return, charge_return, net_return = self.execution_model.evaluate(
+            side, pred.price_at_signal, exit_price,
+        )
+        raw_return = (exit_price - pred.price_at_signal) / pred.price_at_signal
 
         # Update in-memory stats
         bucket_key = (pred.state, pred.horizon_seconds)
         with self._stats_lock:
             bucket = self._stats.setdefault(bucket_key, PredictionStatBucket())
-            bucket.add(directional_return, self.cost)
+            bucket.add(directional_return, charge_return)
 
         self.predictions_evaluated += 1
         if timed_out:
@@ -2032,12 +2185,19 @@ class PredictionTracker:
             "score":            round(pred.score, 3),
             "evidence":         round(pred.evidence, 2),
             "price_at_signal":  round(pred.price_at_signal, 4),
-            "price_at_horizon": round(current_price, 4),
+            "ltp_at_signal":    round(pred.ltp_at_signal, 4),
+            "bid_at_signal":    round(pred.best_bid_at_signal, 4),
+            "ask_at_signal":    round(pred.best_ask_at_signal, 4),
+            "price_at_horizon": round(exit_price, 4),
+            "ltp_at_horizon":   round(current_price, 4),
+            "bid_at_horizon":   round(float(best_bid or 0.0), 4),
+            "ask_at_horizon":   round(float(best_ask or 0.0), 4),
             "raw_return_pct":       round(raw_return * 100, 4),
             "directional_return_pct": round(directional_return * 100, 4),
-            "net_return_pct":       round((directional_return - self.cost) * 100, 4),
+            "charges_pct":          round(charge_return * 100, 4),
+            "net_return_pct":       round(net_return * 100, 4),
             "is_hit":               directional_return > 0,
-            "is_net_profitable":    (directional_return - self.cost) > 0,
+            "is_net_profitable":    net_return > 0,
             "timed_out":            timed_out,
         }
         self._recent_completed.append(payload)
@@ -2551,18 +2711,20 @@ class AngelOneWSAdapter:
     @staticmethod
     def parse(msg: Dict[str, Any], symbol: str) -> Optional[MarketSnapshot]:
         """Parse WS parsed-message dict → MarketSnapshot. Returns None if malformed."""
+        received_ts = time.time_ns() / 1_000_000_000.0
         try:
-            # Timestamp: Angel One typically sends `exchange_timestamp` or
-            # `exchange_feed_time_epoch_ms` in milliseconds since epoch.
+            # Keep both clocks. Angel's exchange timestamp is often only
+            # second-resolution; local receive time provides sub-second event
+            # timing while sequence_number provides message identity/order.
             ts_ms = (
                 msg.get("exchange_timestamp")
                 or msg.get("exchange_feed_time_epoch_ms")
                 or msg.get("last_traded_timestamp")
             )
-            if ts_ms:
-                ts = float(ts_ms) / 1000.0
-            else:
-                ts = time.time()
+            exchange_ts = float(ts_ms) / 1000.0 if ts_ms else None
+
+            raw_sequence = msg.get("sequence_number")
+            sequence = int(raw_sequence) if raw_sequence is not None else None
 
             ltp = AngelOneWSAdapter._paise(msg.get("last_traded_price"))
             if ltp <= 0:
@@ -2598,7 +2760,7 @@ class AngelOneWSAdapter:
                 return None
 
             return MarketSnapshot(
-                timestamp=ts,
+                timestamp=received_ts,
                 symbol=symbol,
                 ltp=ltp,
                 ltq=ltq,
@@ -2607,6 +2769,9 @@ class AngelOneWSAdapter:
                 total_sell_qty=tsq,
                 bids=bids,
                 asks=asks,
+                sequence_number=sequence,
+                exchange_timestamp=exchange_ts,
+                received_timestamp=received_ts,
                 upper_circuit=AngelOneWSAdapter._paise(msg.get("upper_circuit_limit")) or None,
                 lower_circuit=AngelOneWSAdapter._paise(msg.get("lower_circuit_limit")) or None,
             )
@@ -3005,6 +3170,7 @@ class Scanner:
             # ही "future price" है उन signals के लिए जो पहले fire हुए थे।
             self._prediction_tracker.on_tick(
                 tracker.symbol, snapshot.ltp, snapshot.timestamp,
+                best_bid=snapshot.best_bid, best_ask=snapshot.best_ask,
             )
 
             result = tracker.engine.update(snapshot)
@@ -3047,6 +3213,8 @@ class Scanner:
                 evidence=result.evidence_strength,
                 price=snapshot.ltp,
                 ts=snapshot.timestamp,
+                best_bid=snapshot.best_bid,
+                best_ask=snapshot.best_ask,
             )
 
         except Exception as e:

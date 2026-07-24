@@ -17,7 +17,7 @@ else
 fi
 
 # --- Detect install directory ---
-# Prefer $HOME/nse_scanner (deploy_vps.sh default), fall back to script's
+# Prefer $HOME/nse_scanner (legacy default), fall back to script's
 # own directory (works when running from cloned repo like NSE-Equity-Intraday/)
 if [ -f "$HOME/nse_scanner/live_hit_rate_analyzer.py" ]; then
     INSTALL_DIR="$HOME/nse_scanner"
@@ -33,7 +33,7 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
 if [ ! -f "${INSTALL_DIR}/live_hit_rate_analyzer.py" ]; then
     echo "❌ live_hit_rate_analyzer.py not found in $INSTALL_DIR"
-    echo "   पहले deploy_vps.sh + git pull चलाइए।"
+    echo "   पहले bash SETUP.sh --setup-only चलाइए, फिर यह script।"
     echo "   Or manually: cd <repo>; ./install_hitrate_service.sh"
     exit 1
 fi

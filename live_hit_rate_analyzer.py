@@ -79,7 +79,7 @@ from typing import Any, Deque, Dict, FrozenSet, List, Optional, Set, Tuple
 # Reuse from main scanner (single dependency)
 from nse_book_scanner import (
     BookDynamicsEngine, DepthLevel, EngineConfig,
-    MarketSnapshot, SignalResult, SignalState,
+    MarketSnapshot, ExecutionCostModel, SignalResult, SignalState,
     _LONG_STATES, _SHORT_STATES, _ACTIONABLE_STATES,
     _STRONG_STATES, _NORMAL_AND_STRONG_STATES,
     AngelOneConnector, AngelOneWSAdapter, ScannerConfig,
@@ -88,8 +88,100 @@ from nse_book_scanner import (
     SessionStateManager, SessionPhase, RVOLCalculator,
     DEFAULT_TRADEABLE_PHASES,
 )
-# CooldownManager reused from paper_trader (avoid duplication)
-from paper_trader import CooldownManager
+# CooldownManager was previously imported from paper_trader. To keep this
+# module runnable as a single-file tool (only nse_book_scanner as dependency),
+# the class is inlined below.
+
+
+class CooldownManager:
+    """
+    Whipsaw protection — enforces minimum wait after exit before re-entering
+    the same symbol.
+
+    Cooldown types:
+      - Regular: after any exit, wait `cooldown_seconds` before any re-entry
+        on the same symbol.
+      - Direction flip: entering the OPPOSITE side within
+        `cooldown_seconds × flip_multiplier` is blocked (flipping right after
+        an exit is usually noise).
+      - Post stop-loss: extends cooldown by `stop_loss_multiplier` when the
+        last exit reason was "stop_loss".
+
+    Thread-safe (RLock) so the WS worker and any UI thread can both read/write.
+    """
+
+    def __init__(
+        self,
+        cooldown_seconds: float = 120.0,
+        flip_multiplier: float = 2.0,
+        stop_loss_multiplier: float = 1.5,
+    ):
+        self.cooldown_seconds = cooldown_seconds
+        self.flip_multiplier = flip_multiplier
+        self.stop_loss_multiplier = stop_loss_multiplier
+
+        self._last_exit_ts: Dict[str, float] = {}
+        self._last_exit_side: Dict[str, str] = {}
+        self._last_exit_reason: Dict[str, str] = {}
+
+        self.total_exits_recorded = 0
+        self.total_entries_blocked = 0
+        self.blocks_by_reason: Dict[str, int] = defaultdict(int)
+
+        self._lock = threading.RLock()
+
+    def record_exit(self, symbol: str, side: str, reason: str, ts: float) -> None:
+        with self._lock:
+            self._last_exit_ts[symbol] = ts
+            self._last_exit_side[symbol] = side
+            self._last_exit_reason[symbol] = reason
+            self.total_exits_recorded += 1
+
+    def can_enter(self, symbol: str, side: str, ts: float) -> Tuple[bool, str]:
+        with self._lock:
+            last_ts = self._last_exit_ts.get(symbol)
+            if last_ts is None:
+                return True, "no_prior_exit"
+
+            elapsed = ts - last_ts
+            last_side = self._last_exit_side.get(symbol, "")
+            last_reason = self._last_exit_reason.get(symbol, "")
+            base = self.cooldown_seconds
+
+            if last_side and last_side != side:
+                required = base * self.flip_multiplier
+                if elapsed < required:
+                    self.total_entries_blocked += 1
+                    self.blocks_by_reason["direction_flip"] += 1
+                    return False, (f"flip_cooldown ({elapsed:.0f}s < "
+                                   f"{required:.0f}s, last exit was {last_side})")
+
+            if last_reason == "stop_loss":
+                required = base * self.stop_loss_multiplier
+                if elapsed < required:
+                    self.total_entries_blocked += 1
+                    self.blocks_by_reason["post_stop_loss"] += 1
+                    return False, (f"post_sl_cooldown ({elapsed:.0f}s < "
+                                   f"{required:.0f}s)")
+
+            if elapsed < base:
+                self.total_entries_blocked += 1
+                self.blocks_by_reason["regular"] += 1
+                return False, f"cooldown ({elapsed:.0f}s < {base:.0f}s)"
+
+        return True, "cooldown_expired"
+
+    def stats(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "cooldown_seconds": self.cooldown_seconds,
+                "flip_multiplier": self.flip_multiplier,
+                "stop_loss_multiplier": self.stop_loss_multiplier,
+                "symbols_tracked": len(self._last_exit_ts),
+                "total_exits_recorded": self.total_exits_recorded,
+                "total_entries_blocked": self.total_entries_blocked,
+                "blocks_by_reason": dict(self.blocks_by_reason),
+            }
 
 # Optional Rich UI
 try:
@@ -398,13 +490,19 @@ class DataFlowHealthMonitor:
 
 @dataclass
 class PendingPrediction:
-    """A signal captured at fire time, awaiting horizon evaluation."""
+    """One independent signal event awaiting executable horizon evaluation."""
     symbol: str
     state: str
     smoothed_score: float
     evidence: float
     regime_label: str
-    price_at_signal: float
+    price_at_signal: float          # executable entry fill, not LTP
+    ltp_at_signal: float
+    best_bid_at_signal: float
+    best_ask_at_signal: float
+    bid_qty_at_signal: int
+    ask_qty_at_signal: int
+    spread_bps_at_signal: float
     ts_fired: float
     horizon_seconds: float
     hour_of_day: int
@@ -516,9 +614,18 @@ class LiveSignal:
     horizon_snapshots: Dict[float, float] = field(default_factory=dict)
     # e.g., {5.0: +0.0012, 30.0: +0.0025, 60.0: -0.0003}
 
+    # -- 15-second SURVIVAL EXIT (one-shot check) --
+    # After `survival_check_seconds` elapsed, if MFE so far is below
+    # `survival_min_favor_pct`, the signal is force-closed as if squared off.
+    # Values are set exactly once, on the tick that crosses the survival mark.
+    survival_checked: bool = False
+    survival_passed: bool = False                # True if MFE >= min_favor
+    survival_directional_return: float = 0.0     # dir return at survival mark
+    survival_exit_ts: float = -1.0               # ts at survival mark
+
     # Terminal state
     is_closed: bool = False
-    close_reason: str = ""                   # "max_horizon" / "timeout"
+    close_reason: str = ""                   # "max_horizon" / "timeout" / "survival_exit"
 
     @property
     def is_currently_winning(self) -> bool:
@@ -550,13 +657,24 @@ class LiveSignalMonitor:
     def __init__(
         self,
         horizons_s: List[float],
-        cost_pct: float,
+        cost_model: ExecutionCostModel,
         max_age_s: float = 600.0,
+        survival_check_seconds: float = 0.0,
+        survival_min_favor_pct: float = 0.0001,
     ):
         self.horizons = sorted(float(h) for h in horizons_s)
         self.max_horizon = max(self.horizons) if self.horizons else 60.0
-        self.cost = cost_pct
+        self.cost_model = cost_model
+        self.cost = cost_model.transaction_cost_pct
         self.max_age_s = max(max_age_s, self.max_horizon + 30.0)
+        # One-shot 15-second survival check (0 disables it).
+        self.survival_check_seconds = float(survival_check_seconds)
+        self.survival_min_favor_pct = float(survival_min_favor_pct)
+        self.total_survival_passed = 0
+        self.total_survival_failed = 0
+        # Callback fired once when a signal is closed by the survival exit.
+        # HitRateAnalyzer wires this up to feed its policy bucket.
+        self.survival_exit_callback = None  # type: Optional[Any]
 
         # Open signals keyed by signal_id
         self._open: Dict[int, LiveSignal] = {}
@@ -602,10 +720,17 @@ class LiveSignalMonitor:
             self.total_added += 1
         return sig.signal_id
 
-    def on_tick(self, symbol: str, current_price: float, current_ts: float) -> List[LiveSignal]:
+    def on_tick(
+        self,
+        symbol: str,
+        current_price: float,
+        current_ts: float,
+        best_bid: Optional[float] = None,
+        best_ask: Optional[float] = None,
+    ) -> List[LiveSignal]:
         """
-        Update all open signals for `symbol`. Returns list of signals that
-        closed on this tick (max horizon reached).
+        Update all open signals using the currently executable exit quote.
+        Returns signals closed on this tick (max horizon reached).
         """
         if current_price <= 0:
             return []
@@ -623,12 +748,19 @@ class LiveSignalMonitor:
                 if sig is None:
                     continue   # already closed elsewhere
 
-                # Compute directional return
-                raw = (current_price - sig.price_at_signal) / sig.price_at_signal
-                directional = -raw if sig.state in _SHORT_STATES else raw
+                # Mark each signal at its executable exit side (LONG→bid,
+                # SHORT→ask), including configured latency slippage.
+                side = "SHORT" if sig.state in _SHORT_STATES else "LONG"
+                exit_price = self.cost_model.fill_price(
+                    side=side, is_entry=False, ltp=current_price,
+                    best_bid=best_bid, best_ask=best_ask,
+                )
+                directional = self.cost_model.gross_directional_return(
+                    side, sig.price_at_signal, exit_price,
+                )
                 elapsed = current_ts - sig.ts_fired
 
-                sig.current_price = current_price
+                sig.current_price = exit_price
                 sig.current_directional_return = directional
                 sig.seconds_elapsed = elapsed
                 sig.tick_count += 1
@@ -648,6 +780,43 @@ class LiveSignalMonitor:
                 for h in self.horizons:
                     if h not in sig.horizon_snapshots and elapsed >= h:
                         sig.horizon_snapshots[h] = directional
+
+                # -- 15-second SURVIVAL EXIT (one-shot) --
+                # After survival_check_seconds elapsed, check MFE once:
+                # if it never reached the min-favor threshold, force close
+                # the signal here (as if squared off flat/breakeven).
+                survival_active = (
+                    self.survival_check_seconds > 0
+                    and not sig.survival_checked
+                    and elapsed >= self.survival_check_seconds
+                )
+                if survival_active:
+                    sig.survival_checked = True
+                    sig.survival_directional_return = directional
+                    sig.survival_exit_ts = current_ts
+                    passed = (
+                        sig.max_favorable_excursion >= self.survival_min_favor_pct
+                    )
+                    sig.survival_passed = passed
+                    if passed:
+                        self.total_survival_passed += 1
+                    else:
+                        self.total_survival_failed += 1
+                        # Emit policy outcome BEFORE closing the signal.
+                        if self.survival_exit_callback is not None:
+                            try:
+                                self.survival_exit_callback(
+                                    sig, directional, current_ts,
+                                )
+                            except Exception as e:  # never break the tick loop
+                                logger.debug("survival callback error: %s", e)
+                        sig.is_closed = True
+                        sig.close_reason = "survival_exit"
+                        del self._open[sig_id]
+                        self.recently_closed.append(sig)
+                        newly_closed.append(sig)
+                        self.total_closed += 1
+                        continue
 
                 # Close conditions
                 if elapsed >= sig.max_horizon_s:
@@ -752,7 +921,8 @@ class LiveSignalMonitor:
                 if r > 0: winning += 1
                 elif r < 0: losing += 1
                 else: flat += 1
-                if r > self.cost:
+                charges = self.cost_model.charge_return(s.price_at_signal, s.current_price)
+                if r > charges:
                     net_prof += 1
                 total_ret += r
         return {
@@ -842,6 +1012,7 @@ class HitRateAnalyzer:
         self,
         horizons_s: List[float],
         transaction_cost_pct: float = 0.0006,
+        latency_slippage_bps: float = 0.0,
         log_path: str = "logs/hit_rate_predictions.jsonl",
         max_pending_age_s: float = 600.0,
         min_samples_for_verdict: int = 20,
@@ -852,9 +1023,27 @@ class HitRateAnalyzer:
         allowed_phases: Optional[FrozenSet[SessionPhase]] = None,
         rvol_calculator: Optional[RVOLCalculator] = None,
         min_rvol: float = 0.0,
+        # -- 15-second RULES (Gemini "Sniper" policy) --
+        # entry_confirmation_seconds: signal is recorded only after score
+        # has continuously qualified for this many seconds. 0 disables.
+        # survival_check_seconds / survival_min_favor_pct: one-shot MFE
+        # check applied to each recorded signal; if MFE at that mark is
+        # below the threshold, signal is closed there and its outcome is
+        # recorded in the policy bucket.
+        entry_confirmation_seconds: float = 0.0,
+        entry_score_threshold: Optional[float] = None,
+        entry_min_evidence: float = 0.0,
+        survival_check_seconds: float = 0.0,
+        survival_min_favor_pct: float = 0.0001,   # 0.01% MFE required
     ):
         self.horizons = sorted(float(h) for h in horizons_s)
-        self.cost = transaction_cost_pct
+        self.execution_model = ExecutionCostModel(
+            transaction_cost_pct=transaction_cost_pct,
+            latency_slippage_bps=latency_slippage_bps,
+        )
+        # Compatibility alias used by UI/report code; spread is modeled
+        # separately through executable bid/ask fills.
+        self.cost = self.execution_model.transaction_cost_pct
         self.min_samples = min_samples_for_verdict
         self.signal_dedup_seconds = signal_dedup_seconds
 
@@ -930,12 +1119,31 @@ class HitRateAnalyzer:
         # Pending predictions per symbol (per-horizon, for statistical eval)
         self._pending: Dict[str, Deque[PendingPrediction]] = defaultdict(deque)
 
-        # Real-time live signal monitor (per-signal, for live UI)
+        # -- Entry confirmation state (15-second persistence rule) --
+        self.entry_confirmation_seconds = max(0.0, float(entry_confirmation_seconds))
+        # Minimum |score| / evidence a signal must maintain to keep its
+        # pending confirmation alive. None = accept anything actionable.
+        self.entry_score_threshold: Optional[float] = (
+            float(entry_score_threshold) if entry_score_threshold is not None else None
+        )
+        self.entry_min_evidence = float(entry_min_evidence)
+        self._pending_confirmations: Dict[str, Dict[str, Any]] = {}
+        self._entry_armed: Dict[str, bool] = defaultdict(lambda: True)
+        self.confirmations_started: int = 0
+        self.confirmations_cancelled: int = 0
+        self.confirmations_passed: int = 0
+
+        # -- Real-time live signal monitor (per-signal, for live UI) --
         self.live_monitor = LiveSignalMonitor(
             horizons_s=self.horizons,
-            cost_pct=self.cost,
+            cost_model=self.execution_model,
             max_age_s=max_pending_age_s,
+            survival_check_seconds=survival_check_seconds,
+            survival_min_favor_pct=survival_min_favor_pct,
         )
+        # When the monitor closes a signal via the survival exit, record its
+        # outcome in the policy bucket (and drop pending horizons).
+        self.live_monitor.survival_exit_callback = self._on_survival_exit
 
         # Multi-dimensional stats buckets
         self._stats_lock = threading.RLock()
@@ -944,6 +1152,16 @@ class HitRateAnalyzer:
         self._stats_regime: Dict[Tuple[str, str], HitRateBucket] = defaultdict(HitRateBucket)
         self._stats_hour: Dict[Tuple[str, int], HitRateBucket] = defaultdict(HitRateBucket)
         self._stats_symbol: Dict[Tuple[str, str], HitRateBucket] = defaultdict(HitRateBucket)
+        # Per-signal outcome under the 15-second policy (survival exit OR
+        # max horizon exit — one outcome per confirmed signal).
+        self._stats_policy: Dict[str, HitRateBucket] = defaultdict(HitRateBucket)
+        self.policy_survival_exits: int = 0
+        self.policy_max_horizon_exits: int = 0
+        # Track which signals have already been counted in the policy bucket
+        # (a signal reaches policy either via survival_exit callback OR when
+        # it closes normally at max_horizon).
+        self._policy_counted: Set[int] = set()
+        self._open_signal_states: Dict[int, str] = {}
 
         # Log file
         self._log_file = None
@@ -973,8 +1191,94 @@ class HitRateAnalyzer:
         elif evidence < 70: return "50-70"
         else: return "70+"
 
+    # -- 15-second entry confirmation gate --
+
+    def _qualifies_for_entry(self, state: str, result: SignalResult) -> bool:
+        """True while the score/state should keep a pending confirmation alive."""
+        if state not in _ACTIONABLE_STATES:
+            return False
+        if state not in self.allowed_signal_states:
+            return False
+        if self.entry_score_threshold is not None:
+            if abs(result.smoothed_score) < self.entry_score_threshold:
+                return False
+        if result.evidence_strength < self.entry_min_evidence:
+            return False
+        return True
+
+    def _cancel_pending_confirmation(self, symbol: str) -> None:
+        if self._pending_confirmations.pop(symbol, None) is not None:
+            self.confirmations_cancelled += 1
+        self._entry_armed[symbol] = True
+
+    def _confirmation_matured(
+        self, symbol: str, state: str, result: SignalResult, ts: float,
+    ) -> bool:
+        """
+        Track a rolling pending confirmation. Returns True only on the tick
+        where the score has been continuously qualifying for at least
+        `entry_confirmation_seconds`. Direction flips cancel the pending
+        confirmation and re-arm the symbol.
+        """
+        side = "LONG" if state in _LONG_STATES else "SHORT"
+        pending = self._pending_confirmations.get(symbol)
+        if pending is None or pending["side"] != side:
+            if pending is not None:
+                self.confirmations_cancelled += 1
+            elif not self._entry_armed[symbol]:
+                # Same side already confirmed once; wait for score to drop
+                # below threshold before starting a fresh confirmation.
+                return False
+            self._pending_confirmations[symbol] = {
+                "side": side,
+                "started_ts": ts,
+                "last_seen_ts": ts,
+                "state": state,
+                "score": result.smoothed_score,
+                "evidence": result.evidence_strength,
+            }
+            self._entry_armed[symbol] = False
+            self.confirmations_started += 1
+            return False
+
+        pending["last_seen_ts"] = ts
+        pending["state"] = state
+        pending["score"] = result.smoothed_score
+        pending["evidence"] = result.evidence_strength
+        if ts - pending["started_ts"] < self.entry_confirmation_seconds:
+            return False
+
+        # Matured — clear so we don't fire again on the next same-side tick.
+        self._pending_confirmations.pop(symbol, None)
+        self.confirmations_passed += 1
+        return True
+
+    def _on_survival_exit(
+        self, sig: LiveSignal, directional_return: float, current_ts: float,
+    ) -> None:
+        """
+        Called by LiveSignalMonitor when a signal is force-closed at the
+        survival mark. Feed the policy bucket with this single outcome.
+        """
+        if sig.signal_id in self._policy_counted:
+            return
+        self._policy_counted.add(sig.signal_id)
+        # Estimate round-trip charges on the survival exit price.
+        # (We don't have entry_price handy here except via sig.price_at_signal.)
+        charge_return = self.execution_model.charge_return(
+            sig.price_at_signal, sig.current_price,
+        )
+        with self._stats_lock:
+            self._stats_policy[sig.state].add(directional_return, charge_return)
+        self.policy_survival_exits += 1
+        self._open_signal_states.pop(sig.signal_id, None)
+
     def record_signal(
         self, symbol: str, result: SignalResult, price: float, ts: float,
+        best_bid: Optional[float] = None,
+        best_ask: Optional[float] = None,
+        bid_qty: int = 0,
+        ask_qty: int = 0,
     ) -> None:
         """
         Called when scanner fires an actionable signal.
@@ -992,7 +1296,19 @@ class HitRateAnalyzer:
           3. Else → skip (deduped)
         """
         state = result.state.value
-        if state not in _ACTIONABLE_STATES or price <= 0:
+        if price <= 0:
+            return
+
+        # -- 15-SECOND ENTRY CONFIRMATION GATE (runs first so cancellation
+        # sees non-qualifying states too) --
+        if self.entry_confirmation_seconds > 0:
+            if not self._qualifies_for_entry(state, result):
+                self._cancel_pending_confirmation(symbol)
+                return
+            if not self._confirmation_matured(symbol, state, result, ts):
+                return
+
+        if state not in _ACTIONABLE_STATES:
             return
 
         # -- STATE FILTER --
@@ -1049,6 +1365,22 @@ class HitRateAnalyzer:
                 self.signals_blocked_by_low_rvol += 1
                 return
 
+        # Executable entry: LONG crosses ask, SHORT hits bid. Optional latency
+        # slippage is modeled separately from explicit transaction charges.
+        side = "LONG" if state in _LONG_STATES else "SHORT"
+        try:
+            entry_price = self.execution_model.fill_price(
+                side=side, is_entry=True, ltp=price,
+                best_bid=best_bid, best_ask=best_ask,
+            )
+        except ValueError:
+            return
+        if best_bid and best_ask and best_bid > 0 and best_ask >= best_bid:
+            mid = (best_bid + best_ask) / 2.0
+            spread_bps = (best_ask - best_bid) / mid * 10000.0 if mid > 0 else 0.0
+        else:
+            spread_bps = 0.0
+
         # Update dedup memory (record this event)
         self._dedup_last_ts[(symbol, state)] = ts
         self._dedup_last_state[symbol] = state
@@ -1072,26 +1404,41 @@ class HitRateAnalyzer:
                     smoothed_score=result.smoothed_score,
                     evidence=result.evidence_strength,
                     regime_label=regime_label,
-                    price_at_signal=price,
+                    price_at_signal=entry_price,
+                    ltp_at_signal=price,
+                    best_bid_at_signal=float(best_bid or 0.0),
+                    best_ask_at_signal=float(best_ask or 0.0),
+                    bid_qty_at_signal=int(bid_qty),
+                    ask_qty_at_signal=int(ask_qty),
+                    spread_bps_at_signal=spread_bps,
                     ts_fired=ts,
                     horizon_seconds=h,
                     hour_of_day=hour,
                 ))
 
         # Also add to live monitor (per-signal, for real-time UI)
-        self.live_monitor.add_signal(
+        signal_id = self.live_monitor.add_signal(
             symbol=symbol,
             state=state,
             smoothed_score=result.smoothed_score,
             evidence=result.evidence_strength,
             regime_label=regime_label,
-            price=price,
+            price=entry_price,
             ts=ts,
         )
+        # Remember state so policy bucket can attribute max-horizon closures
+        # even after the LiveSignal is popped from `_open`.
+        self._open_signal_states[signal_id] = state
 
         self.signals_recorded += 1
 
-    def on_tick(self, symbol: str, current_price: float, current_ts: float) -> None:
+    def on_tick(
+        self, symbol: str, current_price: float, current_ts: float,
+        best_bid: Optional[float] = None,
+        best_ask: Optional[float] = None,
+        bid_qty: int = 0,
+        ask_qty: int = 0,
+    ) -> None:
         """
         Called on every tick. Two things happen:
           1. LiveSignalMonitor.on_tick — updates real-time state of ALL open
@@ -1099,8 +1446,29 @@ class HitRateAnalyzer:
           2. Evaluate any pending predictions whose horizons have expired
              → statistical stats update
         """
-        # Real-time update (fast, always run)
-        self.live_monitor.on_tick(symbol, current_price, current_ts)
+        # Real-time update (fast, always run). newly_closed contains signals
+        # that either reached max_horizon, timed out, OR were closed by the
+        # survival-exit rule (already accounted for via callback).
+        newly_closed = self.live_monitor.on_tick(
+            symbol, current_price, current_ts,
+            best_bid=best_bid, best_ask=best_ask,
+        )
+        for sig in newly_closed:
+            if sig.close_reason == "survival_exit":
+                continue  # already added to policy bucket via callback
+            if sig.signal_id in self._policy_counted:
+                continue
+            self._policy_counted.add(sig.signal_id)
+            state = self._open_signal_states.pop(sig.signal_id, sig.state)
+            charge_return = self.execution_model.charge_return(
+                sig.price_at_signal, sig.current_price,
+            )
+            with self._stats_lock:
+                self._stats_policy[state].add(
+                    sig.current_directional_return, charge_return,
+                )
+            if sig.close_reason == "max_horizon":
+                self.policy_max_horizon_exits += 1
 
         # Horizon-based statistical evaluation (with lock — UI thread also reads pending_count)
         with self._pending_lock:
@@ -1112,9 +1480,17 @@ class HitRateAnalyzer:
             for pred in pending:
                 age = current_ts - pred.ts_fired
                 if age >= pred.horizon_seconds:
-                    self._evaluate(pred, current_price, current_ts, timed_out=False)
+                    self._evaluate(
+                        pred, current_price, current_ts, timed_out=False,
+                        best_bid=best_bid, best_ask=best_ask,
+                        bid_qty=bid_qty, ask_qty=ask_qty,
+                    )
                 elif age > self.max_pending_age:
-                    self._evaluate(pred, current_price, current_ts, timed_out=True)
+                    self._evaluate(
+                        pred, current_price, current_ts, timed_out=True,
+                        best_bid=best_bid, best_ask=best_ask,
+                        bid_qty=bid_qty, ask_qty=ask_qty,
+                    )
                 else:
                     remaining.append(pred)
 
@@ -1126,20 +1502,33 @@ class HitRateAnalyzer:
     def _evaluate(
         self, pred: PendingPrediction, current_price: float,
         current_ts: float, timed_out: bool,
+        best_bid: Optional[float] = None,
+        best_ask: Optional[float] = None,
+        bid_qty: int = 0,
+        ask_qty: int = 0,
     ) -> None:
-        """Evaluate a matured pending prediction."""
-        raw_return = (current_price - pred.price_at_signal) / pred.price_at_signal
-        # Sign-flip for SHORT so directional_return > 0 always means "correct"
-        directional = -raw_return if pred.state in _SHORT_STATES else raw_return
+        """Evaluate at executable exit quote with spread and charges separated."""
+        side = "SHORT" if pred.state in _SHORT_STATES else "LONG"
+        try:
+            exit_price = self.execution_model.fill_price(
+                side=side, is_entry=False, ltp=current_price,
+                best_bid=best_bid, best_ask=best_ask,
+            )
+        except ValueError:
+            return
+        directional, charge_return, net_return = self.execution_model.evaluate(
+            side, pred.price_at_signal, exit_price,
+        )
+        raw_return = (exit_price - pred.price_at_signal) / pred.price_at_signal
 
         evidence_bucket = self._evidence_bucket(pred.evidence)
 
         with self._stats_lock:
-            self._stats_state_horizon[(pred.state, pred.horizon_seconds)].add(directional, self.cost)
-            self._stats_evidence[(pred.state, evidence_bucket)].add(directional, self.cost)
-            self._stats_regime[(pred.state, pred.regime_label)].add(directional, self.cost)
-            self._stats_hour[(pred.state, pred.hour_of_day)].add(directional, self.cost)
-            self._stats_symbol[(pred.state, pred.symbol)].add(directional, self.cost)
+            self._stats_state_horizon[(pred.state, pred.horizon_seconds)].add(directional, charge_return)
+            self._stats_evidence[(pred.state, evidence_bucket)].add(directional, charge_return)
+            self._stats_regime[(pred.state, pred.regime_label)].add(directional, charge_return)
+            self._stats_hour[(pred.state, pred.hour_of_day)].add(directional, charge_return)
+            self._stats_symbol[(pred.state, pred.symbol)].add(directional, charge_return)
 
         self.predictions_evaluated += 1
         if timed_out:
@@ -1160,12 +1549,24 @@ class HitRateAnalyzer:
                 "regime":           pred.regime_label,
                 "hour":             pred.hour_of_day,
                 "price_at_signal":  round(pred.price_at_signal, 4),
-                "price_at_horizon": round(current_price, 4),
+                "ltp_at_signal":    round(pred.ltp_at_signal, 4),
+                "bid_at_signal":    round(pred.best_bid_at_signal, 4),
+                "ask_at_signal":    round(pred.best_ask_at_signal, 4),
+                "bid_qty_at_signal": pred.bid_qty_at_signal,
+                "ask_qty_at_signal": pred.ask_qty_at_signal,
+                "spread_bps_at_signal": round(pred.spread_bps_at_signal, 3),
+                "price_at_horizon": round(exit_price, 4),
+                "ltp_at_horizon":   round(current_price, 4),
+                "bid_at_horizon":   round(float(best_bid or 0.0), 4),
+                "ask_at_horizon":   round(float(best_ask or 0.0), 4),
+                "bid_qty_at_horizon": int(bid_qty),
+                "ask_qty_at_horizon": int(ask_qty),
                 "raw_return_pct":       round(raw_return * 100, 4),
                 "directional_return_pct": round(directional * 100, 4),
-                "net_return_pct":       round((directional - self.cost) * 100, 4),
+                "charges_pct":          round(charge_return * 100, 4),
+                "net_return_pct":       round(net_return * 100, 4),
                 "is_hit":               directional > 0,
-                "is_net_profitable":    (directional - self.cost) > 0,
+                "is_net_profitable":    net_return > 0,
                 "timed_out":            timed_out,
             }
             with self._log_lock:
@@ -1195,6 +1596,11 @@ class HitRateAnalyzer:
     def snapshot_symbol(self) -> Dict[Tuple[str, str], HitRateBucket]:
         with self._stats_lock:
             return {k: HitRateBucket(**v.__dict__) for k, v in self._stats_symbol.items()}
+
+    def snapshot_policy(self) -> Dict[str, HitRateBucket]:
+        """One-outcome-per-signal stats under the 15-second entry+exit policy."""
+        with self._stats_lock:
+            return {k: HitRateBucket(**v.__dict__) for k, v in self._stats_policy.items()}
 
     def pending_count(self) -> int:
         with self._pending_lock:
@@ -1350,7 +1756,11 @@ class LiveHitRateSession:
                 )
 
             # STEP 1: Evaluate any pending predictions for this symbol
-            self.analyzer.on_tick(symbol, snap.ltp, snap.timestamp)
+            self.analyzer.on_tick(
+                symbol, snap.ltp, snap.timestamp,
+                best_bid=snap.best_bid, best_ask=snap.best_ask,
+                bid_qty=snap.best_bid_qty, ask_qty=snap.best_ask_qty,
+            )
 
             # STEP 2: Engine update to get new signal
             engine = self.engines.get(symbol)
@@ -1366,9 +1776,15 @@ class LiveHitRateSession:
             self.signal_state_counts[state] += 1
             self.regime_counts[result.metrics.regime.label] += 1
 
-            # STEP 3: Record actionable signals for hit rate tracking
-            if state in _ACTIONABLE_STATES:
-                self.analyzer.record_signal(symbol, result, snap.ltp, snap.timestamp)
+            # STEP 3: Feed EVERY signal into the analyzer so the 15-second
+            # entry-confirmation gate can cancel pending confirmations when
+            # the state falls out of the qualifying zone. Non-actionable
+            # states short-circuit inside record_signal.
+            self.analyzer.record_signal(
+                symbol, result, snap.ltp, snap.timestamp,
+                best_bid=snap.best_bid, best_ask=snap.best_ask,
+                bid_qty=snap.best_bid_qty, ask_qty=snap.best_ask_qty,
+            )
 
         except Exception as e:
             logger.exception("_on_tick error: %s", e)
@@ -1512,7 +1928,7 @@ class HitRateUI:
         line3 = Text.assemble(
             (f"Latency p50={p50_us:.0f}µs p99={p99_us:.0f}µs", "dim"),
             ("   |   ", "dim"),
-            (f"Cost: -{self.analyzer.cost*100:.2f}%", "dim"),
+            (f"Execution: {self.analyzer.execution_model.description()}", "dim"),
             ("   |   ", "dim"),
             (f"Signals closed (max horizon): "
              f"{self.analyzer.live_monitor.total_max_horizon_closed:,}", "dim"),
@@ -1847,7 +2263,7 @@ def generate_eod_report(session: LiveHitRateSession, analyzer: HitRateAnalyzer) 
                      f"(signals recorded while RVOL still warming up)")
     lines.append(f"  Predictions evaluated: {analyzer.predictions_evaluated:,}")
     lines.append(f"  Pending (not yet expired): {analyzer.pending_count():,}")
-    lines.append(f"  Cost model          : -{analyzer.cost*100:.4f}% round-trip")
+    lines.append(f"  Execution model     : {analyzer.execution_model.description()}")
 
     # -- Signal-quality-gate detail sections --
     if analyzer.session_manager is not None:
@@ -1905,7 +2321,7 @@ def generate_eod_report(session: LiveHitRateSession, analyzer: HitRateAnalyzer) 
     lines.append("─" * W)
     lines.append("  🎯 HIT RATE BY STATE × HORIZON")
     lines.append("─" * W)
-    lines.append(f"  Column meanings (COST = {analyzer.cost*100:.3f}% round-trip):")
+    lines.append(f"  Column meanings (CHARGES = {analyzer.cost*100:.3f}% round-trip; spread via bid/ask):")
     lines.append(f"    Hit %       = % of signals that went in predicted direction")
     lines.append(f"    %AboveCost  = % of signals where profit > cost (COUNT, not amount)")
     lines.append(f"    AvgRet %    = average per-trade return BEFORE cost (small = noise)")
@@ -2078,6 +2494,54 @@ def generate_eod_report(session: LiveHitRateSession, analyzer: HitRateAnalyzer) 
     else:
         lines.append("  (No symbols with ≥ 20 predictions yet)")
 
+    # -- POLICY OUTCOME (15-second entry confirmation + survival exit) --
+    lines.append("")
+    lines.append("─" * W)
+    lines.append("  🎯 15-SECOND POLICY OUTCOME (one row per confirmed signal)")
+    lines.append("─" * W)
+    lines.append(
+        f"  Entry confirmation : "
+        f"{analyzer.entry_confirmation_seconds:.0f}s continuous qualification "
+        f"({'ON' if analyzer.entry_confirmation_seconds > 0 else 'off'})"
+    )
+    lines.append(
+        f"  Survival exit      : {analyzer.live_monitor.survival_check_seconds:.0f}s "
+        f"MFE ≥ {analyzer.live_monitor.survival_min_favor_pct*100:.3f}% "
+        f"({'ON' if analyzer.live_monitor.survival_check_seconds > 0 else 'off'})"
+    )
+    lines.append(
+        f"  Confirmations      : started {analyzer.confirmations_started:,}  "
+        f"passed {analyzer.confirmations_passed:,}  "
+        f"cancelled {analyzer.confirmations_cancelled:,}"
+    )
+    lines.append(
+        f"  Survival check     : passed {analyzer.live_monitor.total_survival_passed:,}  "
+        f"failed {analyzer.live_monitor.total_survival_failed:,}"
+    )
+    lines.append(
+        f"  Policy exits       : survival {analyzer.policy_survival_exits:,}  "
+        f"max_horizon {analyzer.policy_max_horizon_exits:,}"
+    )
+    policy_stats = analyzer.snapshot_policy()
+    if any(b.count for b in policy_stats.values()):
+        lines.append("")
+        lines.append(f"  {'State':<14} {'N':>7} {'Hit %':>8} "
+                     f"{'AvgRet %':>10} {'NetEdge %':>11} {'Verdict':<20}")
+        lines.append("  " + "-" * (W - 2))
+        for state in ["STRONG_LONG", "LONG", "WEAK_LONG",
+                      "WEAK_SHORT", "SHORT", "STRONG_SHORT"]:
+            b = policy_stats.get(state)
+            if b is None or b.count == 0:
+                continue
+            verdict, _ = analyzer.verdict(b)
+            lines.append(f"  {state:<14} {b.count:>6,} "
+                         f"{b.hit_rate*100:>7.1f}% "
+                         f"{b.avg_return*100:>+9.3f}% "
+                         f"{b.avg_net_edge*100:>+10.3f}% {verdict:<20}")
+    else:
+        lines.append("")
+        lines.append("  (No confirmed signals have closed yet — run longer)")
+
     # -- HONEST VERDICT --
     lines.append("")
     lines.append("═" * W)
@@ -2190,7 +2654,34 @@ Examples:
                    help="Comma-separated horizons in seconds "
                         "(default: 5,15,30,60,120,300)")
     p.add_argument("--cost-pct", type=float, default=0.0006,
-                   help="Round-trip transaction cost (default: 0.0006 = 0.06%%)")
+                   help="Explicit round-trip charges excluding spread "
+                        "(default: 0.0006 = 0.06%%)")
+    p.add_argument("--latency-slippage-bps", type=float, default=0.0,
+                   help="Optional adverse slippage per fill in bps, separate "
+                        "from bid/ask spread (default: 0)")
+
+    # -- 15-SECOND RULES (Gemini "Sniper" policy) --
+    p.add_argument("--entry-confirmation-sec", type=float, default=15.0,
+                   help="Signal recorded only after score continuously "
+                        "qualifies for N seconds (default 15.0, set 0 to "
+                        "disable). Cancels + rearms on direction flip or "
+                        "score falling below threshold.")
+    p.add_argument("--entry-score", type=float, default=4.0,
+                   help="Min |smoothed_score| a signal must maintain during "
+                        "the confirmation window (default 4.0 = calibrated "
+                        "STRONG threshold; the older '8.0' in some prompts "
+                        "is unreachable in live NSE data).")
+    p.add_argument("--entry-evidence", type=float, default=30.0,
+                   help="Min evidence_strength during confirmation (default 30)")
+    p.add_argument("--survival-check-sec", type=float, default=15.0,
+                   help="One-shot check N seconds after entry; if MFE is "
+                        "below --survival-min-favor-pct, the signal is "
+                        "closed at that moment (default 15.0, set 0 to "
+                        "disable).")
+    p.add_argument("--survival-min-favor-pct", type=float, default=0.0001,
+                   help="Minimum favorable MFE %% within the survival "
+                        "window (default 0.0001 = 0.01%%). Below this, the "
+                        "signal is squared off at the survival mark.")
     p.add_argument("--symbols", default=None,
                    help="Comma-separated symbol subset (default: all from config)")
     p.add_argument("--min-samples", type=int, default=20,
@@ -2405,6 +2896,7 @@ def main() -> int:
     analyzer = HitRateAnalyzer(
         horizons_s=horizons,
         transaction_cost_pct=args.cost_pct,
+        latency_slippage_bps=args.latency_slippage_bps,
         log_path=args.log_path,
         min_samples_for_verdict=args.min_samples,
         signal_dedup_seconds=args.dedup_seconds,
@@ -2412,6 +2904,11 @@ def main() -> int:
         allowed_phases=allowed_phases_set,
         rvol_calculator=rvol_calculator,
         min_rvol=args.min_rvol,
+        entry_confirmation_seconds=args.entry_confirmation_sec,
+        entry_score_threshold=args.entry_score,
+        entry_min_evidence=args.entry_evidence,
+        survival_check_seconds=args.survival_check_sec,
+        survival_min_favor_pct=args.survival_min_favor_pct,
     )
     # Propagate strict-warmup flag (constructor doesn't take it directly
     # to keep signature small; setting attribute directly is cheap)
