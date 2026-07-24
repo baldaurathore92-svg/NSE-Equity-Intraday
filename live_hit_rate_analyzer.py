@@ -4383,7 +4383,8 @@ class HitRateAnalyzer:
         # outcome in the policy bucket (and drop pending horizons).
         self.live_monitor.survival_exit_callback = self._on_survival_exit
 
-        # Multi-dimensional stats buckets
+        # Multi-dimensional stats buckets — EXECUTABLE (bid/ask fills, spread
+        # crossed on both sides). This is the trader-honest measurement.
         self._stats_lock = threading.RLock()
         self._stats_state_horizon: Dict[Tuple[str, float], HitRateBucket] = defaultdict(HitRateBucket)
         self._stats_evidence: Dict[Tuple[str, str], HitRateBucket] = defaultdict(HitRateBucket)
@@ -4393,6 +4394,13 @@ class HitRateAnalyzer:
         # Per-signal outcome under the 15-second policy (survival exit OR
         # max horizon exit — one outcome per confirmed signal).
         self._stats_policy: Dict[str, HitRateBucket] = defaultdict(HitRateBucket)
+        # PARALLEL bucket computed the OLD way (LTP-to-LTP minus flat cost).
+        # Same signals, same horizons, but scored using naive LTP so users
+        # can compare 'yesterday's number' side-by-side with the honest one.
+        # This is DIAGNOSTIC / REFERENCE only — do NOT trust it for real
+        # trading decisions. Spread crossing is real money and this bucket
+        # ignores it.
+        self._stats_state_horizon_ltp: Dict[Tuple[str, float], HitRateBucket] = defaultdict(HitRateBucket)
         self.policy_survival_exits: int = 0
         self.policy_max_horizon_exits: int = 0
         # Track which signals have already been counted in the policy bucket
@@ -4759,6 +4767,18 @@ class HitRateAnalyzer:
         )
         raw_return = (exit_price - pred.price_at_signal) / pred.price_at_signal
 
+        # PARALLEL diagnostic bucket — same signal, same horizon, but scored
+        # with the pre-P0 naive LTP-to-LTP definition. This is how the OLD
+        # scanner reports would have measured this signal (spread ignored,
+        # flat cost subtracted). Populated so users can compare "old style"
+        # hit rate with the trader-honest executable version side-by-side.
+        # See report section '📊 LTP-only diagnostic'.
+        if pred.ltp_at_signal > 0 and current_price > 0:
+            ltp_raw = (current_price - pred.ltp_at_signal) / pred.ltp_at_signal
+            ltp_directional = -ltp_raw if pred.state in _SHORT_STATES else ltp_raw
+        else:
+            ltp_directional = 0.0
+
         evidence_bucket = self._evidence_bucket(pred.evidence)
 
         with self._stats_lock:
@@ -4767,6 +4787,12 @@ class HitRateAnalyzer:
             self._stats_regime[(pred.state, pred.regime_label)].add(directional, charge_return)
             self._stats_hour[(pred.state, pred.hour_of_day)].add(directional, charge_return)
             self._stats_symbol[(pred.state, pred.symbol)].add(directional, charge_return)
+            # LTP-only diagnostic parallel bucket. Uses the SAME charge value
+            # (fixed transaction_cost_pct) so the LTP net-edge column matches
+            # what the pre-P0 reports would have printed.
+            self._stats_state_horizon_ltp[(pred.state, pred.horizon_seconds)].add(
+                ltp_directional, self.execution_model.transaction_cost_pct,
+            )
 
         self.predictions_evaluated += 1
         if timed_out:
@@ -4839,6 +4865,18 @@ class HitRateAnalyzer:
         """One-outcome-per-signal stats under the 15-second entry+exit policy."""
         with self._stats_lock:
             return {k: HitRateBucket(**v.__dict__) for k, v in self._stats_policy.items()}
+
+    def snapshot_state_horizon_ltp(self) -> Dict[Tuple[str, float], HitRateBucket]:
+        """
+        LTP-only diagnostic parallel of snapshot_state_horizon() — same
+        signals, same horizons, but scored the OLD (pre-P0) way using
+        LTP-to-LTP without any spread-crossing cost. Included in reports
+        purely for comparison against the executable (bid/ask) numbers so
+        users can see how much spread cost was hidden by the old model.
+        """
+        with self._stats_lock:
+            return {k: HitRateBucket(**v.__dict__)
+                    for k, v in self._stats_state_horizon_ltp.items()}
 
     def pending_count(self) -> int:
         with self._pending_lock:
@@ -5728,6 +5766,73 @@ def generate_eod_report(session: LiveHitRateSession, analyzer: HitRateAnalyzer) 
             lines.append(f"  {state:<14} {int(h):>6}s  {b.count:>6,} "
                          f"{hit:>7.1f}% {netp:>12.1f}% {avg:>+9.3f}% "
                          f"{edge:>+10.3f}% {verdict:<20}")
+
+    # -- LTP-ONLY DIAGNOSTIC — same signals, scored the OLD way for comparison --
+    lines.append("")
+    lines.append("─" * W)
+    lines.append("  📊 LTP-ONLY DIAGNOSTIC — same signals, old naive LTP scoring")
+    lines.append("─" * W)
+    lines.append("  Same predictions as the table above, but scored the pre-P0 way:")
+    lines.append("    * Return = (LTP_at_horizon − LTP_at_signal) / LTP_at_signal")
+    lines.append("    * Spread cost IGNORED (no bid/ask crossing)")
+    lines.append("    * Flat 0.06% subtracted as 'cost' regardless of trade size")
+    lines.append("  यह पुराने reports में जो number आता था वही है। TRADER TRUTH is above")
+    lines.append("  (bid/ask executable) — यह table सिर्फ historical comparison के लिए।")
+    lines.append("")
+    stats_ltp = analyzer.snapshot_state_horizon_ltp()
+    lines.append(f"  {'State':<14} {'Horizon':>8} {'N':>7} {'Hit % LTP':>10} "
+                 f"{'Hit % Exec':>11} {'Δ Hit %':>9} "
+                 f"{'NetEdge LTP':>13} {'NetEdge Exec':>14}")
+    lines.append("  " + "-" * (W - 2))
+    total_ltp_count = 0
+    total_ltp_hits = 0
+    total_exec_hits = 0
+    total_ltp_net = 0.0
+    total_exec_net = 0.0
+    for state in ["STRONG_LONG", "LONG", "WEAK_LONG",
+                  "WEAK_SHORT", "SHORT", "STRONG_SHORT"]:
+        for h in analyzer.horizons:
+            b_ltp = stats_ltp.get((state, h))
+            b_exec = stats_sh.get((state, h))
+            if b_ltp is None or b_ltp.count == 0:
+                continue
+            hit_ltp = b_ltp.hit_rate * 100
+            hit_exec = b_exec.hit_rate * 100 if b_exec else 0.0
+            edge_ltp = b_ltp.avg_net_edge * 100
+            edge_exec = b_exec.avg_net_edge * 100 if b_exec else 0.0
+            delta = hit_ltp - hit_exec
+            total_ltp_count += b_ltp.count
+            total_ltp_hits += b_ltp.hits
+            total_exec_hits += b_exec.hits if b_exec else 0
+            total_ltp_net += b_ltp.sum_net_return
+            total_exec_net += b_exec.sum_net_return if b_exec else 0
+            lines.append(f"  {state:<14} {int(h):>6}s  {b_ltp.count:>6,} "
+                         f"{hit_ltp:>9.1f}% {hit_exec:>10.1f}% {delta:>+7.1f}%  "
+                         f"{edge_ltp:>+11.3f}% {edge_exec:>+12.3f}%")
+
+    if total_ltp_count > 0:
+        overall_ltp_hit = total_ltp_hits / total_ltp_count * 100
+        overall_exec_hit = total_exec_hits / total_ltp_count * 100
+        overall_ltp_edge = total_ltp_net / total_ltp_count * 100
+        overall_exec_edge = total_exec_net / total_ltp_count * 100
+        lines.append("  " + "-" * (W - 2))
+        lines.append(
+            f"  {'OVERALL':<14} {'—':>7}  {total_ltp_count:>6,} "
+            f"{overall_ltp_hit:>9.1f}% {overall_exec_hit:>10.1f}% "
+            f"{overall_ltp_hit - overall_exec_hit:>+7.1f}%  "
+            f"{overall_ltp_edge:>+11.3f}% {overall_exec_edge:>+12.3f}%"
+        )
+        lines.append("")
+        lines.append("  📌 Interpretation:")
+        lines.append(f"     LTP-only says {overall_ltp_hit:.1f}% hit rate — "
+                     f"the number old reports would print.")
+        lines.append(f"     Executable says {overall_exec_hit:.1f}% — "
+                     f"what a real trader would experience.")
+        drop = overall_ltp_hit - overall_exec_hit
+        if drop > 5:
+            lines.append(f"     Δ = {drop:+.1f} pp gap = hidden spread cost. Signals that")
+            lines.append(f"     moved less than one full spread showed up as 'hits' in")
+            lines.append(f"     the old model but would have LOST money in real trading.")
 
     # By evidence bucket
     lines.append("")
