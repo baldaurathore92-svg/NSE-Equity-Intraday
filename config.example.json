@@ -58,8 +58,9 @@
         "history_seconds": 60,
         "depth_decay_frac": 0.005,
         "ema_alpha": 0.3,
-        "threshold_strong": 8.0,
-        "threshold_normal": 5.0,
+        "_comment_thresholds": "Empirically calibrated on 67k+ live NSE signals. Smoothed score practically caps around ±5 due to 8-feature weighted average + EMA α=0.3. Old defaults 8.0/5.0/2.0 were unreachable — STRONG_LONG never fired.",
+        "threshold_strong": 4.0,
+        "threshold_normal": 3.0,
         "threshold_weak": 2.0,
         "spoof_dampener_strength": 0.5,
         "kill_switch_spread_multiplier": 3.0

@@ -15,10 +15,11 @@
 
 ### Runtime पर सिर्फ इन files की ज़रूरत है
 
-- `live_hit_rate_analyzer.py` — CLI + rich UI + measurement engine
-- `nse_book_scanner.py` — BookDynamicsEngine, Angel One WS adapter, session/RVOL gates
-- `config.json` (users creates from `config.example.json`)
+- `live_hit_rate_analyzer.py` — SINGLE Python file (~5,800 lines): engine + Angel One WS adapter + session/RVOL gates + HitRateAnalyzer + CLI + rich UI
+- `config.json` (user creates from `config.example.json`)
 - `SETUP.sh` — one-command install + launch
+
+Engine self-test किसी भी config के बिना: `python3 live_hit_rate_analyzer.py --engine-demo`
 
 ### One-command run
 
