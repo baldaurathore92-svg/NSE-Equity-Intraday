@@ -4273,6 +4273,12 @@ class HitRateAnalyzer:
         entry_min_evidence: float = 0.0,
         survival_check_seconds: float = 0.0,
         survival_min_favor_pct: float = 0.0001,   # 0.01% MFE required
+        # -- Experimental contrarian mode --
+        # If True, LONG↔SHORT states are swapped at record time. Used to
+        # test the operator-trap hypothesis empirically. Every downstream
+        # bucket/log/report will show the SWAPPED state; no code path
+        # needs to know about the invert flag except this constructor.
+        invert_signals: bool = False,
     ):
         self.horizons = sorted(float(h) for h in horizons_s)
         self.execution_model = ExecutionCostModel(
@@ -4324,6 +4330,30 @@ class HitRateAnalyzer:
         # bloat).
         self.allowed_signal_states: set = set(_ACTIONABLE_STATES)
         self.signals_blocked_by_state_filter: int = 0
+
+        # -- Contrarian mode --
+        # When True, we flip LONG↔SHORT at record time. Kept as a plain
+        # attribute so it's discoverable in the health dump / EOD report.
+        self.invert_signals: bool = bool(invert_signals)
+        if self.invert_signals:
+            logger.warning(
+                "═" * 70,
+            )
+            logger.warning(
+                "  ⚠  --invert-signals ENABLED — LONG↔SHORT will be SWAPPED at record time"
+            )
+            logger.warning(
+                "     This is an EXPERIMENTAL contrarian mode. Use only to test the"
+            )
+            logger.warning(
+                "     operator-trap hypothesis on your data. Every bucket, log line,"
+            )
+            logger.warning(
+                "     and report label will show the SWAPPED state, NOT the raw signal."
+            )
+            logger.warning(
+                "═" * 70,
+            )
 
         # Guard: max_pending_age MUST be greater than the largest horizon,
         # otherwise long-horizon predictions would silently timeout before
@@ -4542,6 +4572,24 @@ class HitRateAnalyzer:
           3. Else → skip (deduped)
         """
         state = result.state.value
+
+        # -- EXPERIMENTAL CONTRARIAN MODE (--invert-signals) --
+        # Swap LONG↔SHORT so a signal generator that's systematically
+        # trapping the retail direction can be tested with one flag flip.
+        # Applied BEFORE any gate so every downstream check (state filter,
+        # cooldown, session, RVOL, dedup) sees the swapped state. Any
+        # unrecognised state is left untouched.
+        if self.invert_signals:
+            _INVERT_MAP = {
+                "STRONG_LONG":  "STRONG_SHORT",
+                "LONG":         "SHORT",
+                "WEAK_LONG":    "WEAK_SHORT",
+                "STRONG_SHORT": "STRONG_LONG",
+                "SHORT":        "LONG",
+                "WEAK_SHORT":   "WEAK_LONG",
+            }
+            state = _INVERT_MAP.get(state, state)
+
         if price <= 0:
             return
 
@@ -6194,6 +6242,40 @@ def _verify_horizons(path: str, limit: int = 20) -> int:
 
     ranked = sorted(grouped.items(), key=lambda kv: -_divergence(kv[1]))
 
+    # ================================================================
+    # STAGE 1: DIRECTIONAL SANITY CHECK
+    # ================================================================
+    # User complaint (in Hindi): "LONG वाले सभी की LTP घट रही है, SHORT
+    # वाले की बढ़ रही है" — i.e., LONG signals seem to predict DOWN moves
+    # and SHORT signals seem to predict UP moves. This would be either a
+    # signal-generator inversion bug OR an operator-trap (spoofed bids/asks
+    # trigger signals; smart money fades them). Either way we should
+    # QUANTIFY it before drawing any conclusion.
+    #
+    # For every prediction, `directional_return_pct` is already signed such
+    # that POSITIVE = correct direction (regardless of long/short). So:
+    #    LONG side  win-rate = fraction of LONG rows with dir_return > 0
+    #    SHORT side win-rate = fraction of SHORT rows with dir_return > 0
+    # If BOTH are below 50 %, the signal generator has adverse-selection.
+    # ================================================================
+    long_by_h: Dict[float, List[float]] = _dd(list)
+    short_by_h: Dict[float, List[float]] = _dd(list)
+    for hor_map in grouped.values():
+        for h, r in hor_map.items():
+            state_str = str(r.get("state", ""))
+            dr = float(r.get("directional_return_pct", 0.0))
+            if state_str in _LONG_STATES:
+                long_by_h[h].append(dr)
+            elif state_str in _SHORT_STATES:
+                short_by_h[h].append(dr)
+
+    def _rate_and_avg(vals: List[float]) -> Tuple[int, float, float]:
+        if not vals:
+            return 0, 0.0, 0.0
+        wins = sum(1 for v in vals if v > 0)
+        avg = sum(vals) / len(vals)
+        return len(vals), wins / len(vals) * 100.0, avg
+
     # Header
     W = 118
     print("═" * W)
@@ -6204,6 +6286,85 @@ def _verify_horizons(path: str, limit: int = 20) -> int:
     print(f"  Unique signals     : {len(grouped):,}  "
           f"(each signal fans out to up-to-6 horizon rows)")
     print(f"  Parse errors       : {parse_errors:,}")
+
+    # -- Directional sanity check header --
+    print("")
+    print("─" * W)
+    print("  🎯 DIRECTIONAL SANITY CHECK — is the signal generator pointing the right way?")
+    print("─" * W)
+    print(f"  Interpretation: for each side, % of horizons where price moved AS PREDICTED.")
+    print(f"    > 50 % at 60s+ horizons → signal has real directional edge")
+    print(f"    ~ 50 %                  → noise / no edge")
+    print(f"    < 50 % at ALL horizons  → INVERTED signal or operator-trap "
+          f"(price fades the signal)")
+    print("")
+    all_h = sorted(set(long_by_h.keys()) | set(short_by_h.keys()))
+    print(f"  {'Horizon':>10} | {'LONG N':>8} {'LONG Hit%':>10} {'LONG Avg %':>11}  |"
+          f"  {'SHORT N':>8} {'SHORT Hit%':>11} {'SHORT Avg %':>12}")
+    print(f"  {'-'*10}-+-{'-'*8}-{'-'*10}-{'-'*11}--+-{'-'*8}-{'-'*11}-{'-'*12}")
+    long_verdict_at_max = 50.0
+    short_verdict_at_max = 50.0
+    long_below_50_count = 0
+    short_below_50_count = 0
+    horizons_evaluated = 0
+    for h in all_h:
+        ln, lhit, lavg = _rate_and_avg(long_by_h.get(h, []))
+        sn, shit, savg = _rate_and_avg(short_by_h.get(h, []))
+        if ln == 0 and sn == 0:
+            continue
+        horizons_evaluated += 1
+        # Ignore very short horizons for verdict — spread cost inflates loss counts
+        if h >= 60.0:
+            if ln > 0 and lhit < 50.0:
+                long_below_50_count += 1
+            if sn > 0 and shit < 50.0:
+                short_below_50_count += 1
+            long_verdict_at_max = lhit if ln > 0 else long_verdict_at_max
+            short_verdict_at_max = shit if sn > 0 else short_verdict_at_max
+        long_mark = "⚠" if h >= 60.0 and ln > 0 and lhit < 50.0 else " "
+        short_mark = "⚠" if h >= 60.0 and sn > 0 and shit < 50.0 else " "
+        print(f"  {int(h):>9}s | {ln:>8,} {lhit:>9.1f}% {lavg:>+10.4f}% {long_mark}|"
+              f"  {sn:>8,} {shit:>10.1f}% {savg:>+11.4f}% {short_mark}")
+
+    # -- Diagnosis line --
+    print("")
+    long_horizons_60plus = [h for h in all_h if h >= 60.0 and long_by_h.get(h)]
+    short_horizons_60plus = [h for h in all_h if h >= 60.0 and short_by_h.get(h)]
+    if long_horizons_60plus and short_horizons_60plus and \
+       long_below_50_count == len(long_horizons_60plus) and \
+       short_below_50_count == len(short_horizons_60plus):
+        # Both sides worse than 50 % at every ≥60s horizon → very strong evidence
+        # of adverse selection. This is what a real "operator trap" looks like
+        # in Indian intraday data — the signals are consistent, the market is
+        # consistent, they just don't align in your favour.
+        print(f"  ⚠⚠  DIAGNOSIS: BOTH LONG AND SHORT ARE BELOW 50 % AT EVERY 60s+ HORIZON.")
+        print(f"      This means the signal generator is systematically WRONG on both sides.")
+        print(f"      Most likely causes (ranked by probability in Indian intraday):")
+        print(f"        1. OPERATOR TRAP: fake bids/asks trigger signals; smart money fades.")
+        print(f"           Mitigation: enable --entry-confirmation-sec 15 (sniper policy)")
+        print(f"                       so a fake spike must PERSIST 15s before firing.")
+        print(f"        2. WRONG REGIME: current market is MEAN_REVERTING, not TRENDING.")
+        print(f"           Mitigation: read the regime column in the report; ONLY trade")
+        print(f"                       TRENDING_UP/TRENDING_DOWN, skip RANDOM/MEAN_REVERTING.")
+        print(f"        3. CONTRARIAN TEST: try python3 live_hit_rate_analyzer.py")
+        print(f"                       --config config.json --invert-signals")
+        print(f"           to test whether inverted signals beat 50 %. If they do, the")
+        print(f"           signal features are inverted for THIS market/time-of-day.")
+    elif long_horizons_60plus and long_below_50_count == len(long_horizons_60plus):
+        print(f"  ⚠  LONG-side signals are BELOW 50 % at every 60s+ horizon "
+              f"({long_below_50_count} horizons).")
+        print(f"      SHORT side is behaving normally. Likely: bearish-biased regime,")
+        print(f"      or LONG signal features (book buy-imbalance) are being spoofed.")
+    elif short_horizons_60plus and short_below_50_count == len(short_horizons_60plus):
+        print(f"  ⚠  SHORT-side signals are BELOW 50 % at every 60s+ horizon "
+              f"({short_below_50_count} horizons).")
+        print(f"      LONG side is behaving normally. Likely: bullish-biased regime,")
+        print(f"      or SHORT signal features (book sell-imbalance) are being spoofed.")
+    else:
+        print(f"  ✔  No consistent side-inversion detected at 60s+ horizons.")
+        print(f"      Individual poor horizons may still be spread-cost or sample-size issues.")
+
+    print("")
     print(f"  Showing top {min(limit, len(ranked))} signals by 5s-vs-300s divergence")
     print("")
     print("  Column meanings (per horizon row):")
@@ -6344,6 +6505,15 @@ Examples:
     p.add_argument("--engine-demo", action="store_true",
                    help="Run the 8-scenario BookDynamicsEngine self-test "
                         "(no config or network needed) and exit.")
+    p.add_argument("--invert-signals", action="store_true",
+                   help="EXPERIMENTAL contrarian mode: swap LONG↔SHORT at "
+                        "signal fire time (STRONG_LONG becomes STRONG_SHORT "
+                        "and vice versa). Use this to empirically test the "
+                        "operator-trap hypothesis: if inverted signals beat "
+                        "50%% and vanilla signals lose to 50%%, the book "
+                        "features are being spoofed for THIS market. "
+                        "DO NOT use blindly — first read --verify-horizons "
+                        "diagnosis on your recorded data.")
     p.add_argument("--verify-horizons", metavar="JSONL_PATH", default=None,
                    help="Read a prediction audit log (logs/hit_rate_predictions.jsonl) "
                         "and print per-signal 5s/15s/30s/60s/120s/300s breakdown. "
@@ -6606,6 +6776,7 @@ def main() -> int:
         entry_min_evidence=args.entry_evidence,
         survival_check_seconds=args.survival_check_sec,
         survival_min_favor_pct=args.survival_min_favor_pct,
+        invert_signals=args.invert_signals,
     )
     # Propagate strict-warmup flag (constructor doesn't take it directly
     # to keep signature small; setting attribute directly is cheap)
