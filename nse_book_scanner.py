@@ -1636,7 +1636,15 @@ def _engine_demo() -> None:
     ))
     _demo_print_result(r, "SCENARIO 7: Top-5 Window Shifts (no false cancel/spoof expected)")
 
-    # ---- Scenario 8: Duplicate & out-of-order snapshots ----
+    # ---- Scenario 8: Duplicate / Out-of-order / Same-second update ----
+    # Contract (post-P0):
+    #   * Exact duplicate (identical content, no sequence)     → dropped
+    #   * Earlier event time (no sequence)                     → dropped
+    #   * Same event time BUT new content (no sequence)        → ACCEPTED
+    #     (fixes the bug where genuine same-second book updates were
+    #      being dropped by the old timestamp-only guard)
+    #   * Newer sequence within the same exchange second       → ACCEPTED
+    #   * Duplicate or lower sequence                          → dropped
     eng = BookDynamicsEngine()
     for i in range(5):
         eng.update(_demo_snap(
@@ -1645,21 +1653,72 @@ def _engine_demo() -> None:
             bids=[(149.95, 200), (149.90, 200), (149.85, 200), (149.80, 200), (149.75, 200)],
             asks=[(150.05, 200), (150.10, 200), (150.15, 200), (150.20, 200), (150.25, 200)],
         ))
+    # (a) EXACT duplicate (same ts, same content) → drop
     dup = eng.update(_demo_snap(
-        T0 + 4, ltp=150.00, ltq=5, vol=2_200,   # duplicate ts
+        T0 + 4, ltp=150.00, ltq=5, vol=2_080,
         tbq=30_000, tsq=30_000,
         bids=[(149.95, 200), (149.90, 200), (149.85, 200), (149.80, 200), (149.75, 200)],
         asks=[(150.05, 200), (150.10, 200), (150.15, 200), (150.20, 200), (150.25, 200)],
     ))
+    # (b) Same-second, NEW content → now accepted (was silently dropped before)
+    same_sec_new = eng.update(_demo_snap(
+        T0 + 4, ltp=150.02, ltq=5, vol=2_150,
+        tbq=32_000, tsq=30_000,
+        bids=[(149.97, 300), (149.92, 200), (149.87, 200), (149.82, 200), (149.77, 200)],
+        asks=[(150.05, 200), (150.10, 200), (150.15, 200), (150.20, 200), (150.25, 200)],
+    ))
+    # (c) Out-of-order event time (no sequence) → drop
     ooo = eng.update(_demo_snap(
-        T0 + 3, ltp=150.00, ltq=5, vol=2_300,   # out-of-order
+        T0 + 3, ltp=150.00, ltq=5, vol=2_300,
         tbq=30_000, tsq=30_000,
         bids=[(149.95, 200), (149.90, 200), (149.85, 200), (149.80, 200), (149.75, 200)],
         asks=[(150.05, 200), (150.10, 200), (150.15, 200), (150.20, 200), (150.25, 200)],
     ))
-    print("\n===== SCENARIO 8: Duplicate & Out-of-Order Ticks =====")
-    print(f"  duplicate snapshot result: {dup}  (expected: None)")
-    print(f"  out-of-order snapshot result: {ooo}  (expected: None)")
+
+    # (d) Sequence-based dedup: same exchange second, newer sequence → accept;
+    #     replay of an older sequence → drop.
+    eng2 = BookDynamicsEngine()
+    base = _demo_snap(
+        T0 + 100, ltp=150.00, ltq=5, vol=5_000,
+        tbq=30_000, tsq=30_000,
+        bids=[(149.95, 200), (149.90, 200), (149.85, 200), (149.80, 200), (149.75, 200)],
+        asks=[(150.05, 200), (150.10, 200), (150.15, 200), (150.20, 200), (150.25, 200)],
+    )
+    base.sequence_number = 100
+    base.exchange_timestamp = T0 + 100
+    seq_first = eng2.update(base)
+    later = _demo_snap(
+        T0 + 100, ltp=150.02, ltq=5, vol=5_050,
+        tbq=32_000, tsq=30_000,
+        bids=[(149.97, 300), (149.92, 200), (149.87, 200), (149.82, 200), (149.77, 200)],
+        asks=[(150.05, 200), (150.10, 200), (150.15, 200), (150.20, 200), (150.25, 200)],
+    )
+    later.sequence_number = 101
+    later.exchange_timestamp = T0 + 100
+    seq_next = eng2.update(later)
+    replay = _demo_snap(
+        T0 + 100, ltp=150.02, ltq=5, vol=5_050,
+        tbq=32_000, tsq=30_000,
+        bids=[(149.97, 300), (149.92, 200), (149.87, 200), (149.82, 200), (149.77, 200)],
+        asks=[(150.05, 200), (150.10, 200), (150.15, 200), (150.20, 200), (150.25, 200)],
+    )
+    replay.sequence_number = 100
+    replay.exchange_timestamp = T0 + 100
+    seq_replay = eng2.update(replay)
+
+    print("\n===== SCENARIO 8: Sequence / Timestamp / Dedup Contract =====")
+    print(f"  (a) exact-duplicate no-seq:       {'None' if dup is None else 'SIGNAL'}  "
+          f"(expected: None)")
+    print(f"  (b) same-second new content:      "
+          f"{'SIGNAL' if same_sec_new is not None else 'None'}  (expected: SIGNAL)")
+    print(f"  (c) out-of-order event time:      {'None' if ooo is None else 'SIGNAL'}  "
+          f"(expected: None)")
+    print(f"  (d1) first seq accepted:          "
+          f"{'SIGNAL' if seq_first is not None else 'None'}  (expected: SIGNAL)")
+    print(f"  (d2) newer seq same second:       "
+          f"{'SIGNAL' if seq_next is not None else 'None'}  (expected: SIGNAL)")
+    print(f"  (d3) replay of older seq dropped: {'None' if seq_replay is None else 'SIGNAL'}"
+          f"  (expected: None)")
 
     print("\n### Demo complete. ###\n")
 

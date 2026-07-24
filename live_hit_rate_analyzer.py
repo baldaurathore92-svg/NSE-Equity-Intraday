@@ -883,6 +883,10 @@ class LiveSignalMonitor:
                     time_to_mfe_s=sig.time_to_mfe_s,
                     time_to_mae_s=sig.time_to_mae_s,
                     horizon_snapshots=dict(sig.horizon_snapshots),  # dict copy
+                    survival_checked=sig.survival_checked,
+                    survival_passed=sig.survival_passed,
+                    survival_directional_return=sig.survival_directional_return,
+                    survival_exit_ts=sig.survival_exit_ts,
                     is_closed=sig.is_closed,
                     close_reason=sig.close_reason,
                 )
