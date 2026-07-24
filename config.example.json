@@ -53,16 +53,46 @@
         "prediction_max_pending_age_s": 300.0
     },
 
-    "_comment_engine": "STEP 4: BookDynamicsEngine tuning. Change only after understanding math in book_dynamics_engine.py.",
+    "_comment_engine": "STEP 4: BookDynamicsEngine tuning. Every field below can ALSO be overridden per-run via CLI (e.g. --w-iceberg 1.0). CLI wins over config.json.",
     "engine": {
         "history_seconds": 60,
         "depth_decay_frac": 0.005,
         "ema_alpha": 0.3,
+
         "_comment_thresholds": "Empirically calibrated on 67k+ live NSE signals. Smoothed score practically caps around ±5 due to 8-feature weighted average + EMA α=0.3. Old defaults 8.0/5.0/2.0 were unreachable — STRONG_LONG never fired.",
         "threshold_strong": 4.0,
         "threshold_normal": 3.0,
         "threshold_weak": 2.0,
+
+        "_comment_feature_weights": "Weight of each composite feature. Reduce w_book_wide_imbalance if you suspect deep-book spoofing. w_iceberg is 0 by default (feature was dead code until Nov 2026); set to 1.0 to enable hidden-liquidity signal.",
+        "w_l1_imbalance": 1.0,
+        "w_top5_imbalance": 1.5,
+        "w_weighted_depth": 2.0,
+        "w_book_wide_imbalance": 1.0,
+        "w_imbalance_roc": 2.5,
+        "w_liquidity_flow": 1.5,
+        "w_aggressor_ratio": 2.0,
+        "w_mid_response": 1.5,
+        "w_iceberg": 0.0,
+
+        "_comment_regime_gate": "Opt-in regime-aware gates. Both default false for backwards compatibility. regime_gate_enabled: demote signals to NEUTRAL in RANDOM regime. regime_invert_mean_reverting: flip LONG↔SHORT in confirmed MEAN_REVERTING (contrarian mode).",
+        "regime_gate_enabled": false,
+        "regime_invert_mean_reverting": false,
+
+        "_comment_ema_warmup": "Suppress signals for the first N ticks so EMA can converge past its neutral seed. Fixes 9:15 AM Cold-Start Trap where a single noise tick pinned the EMA for 2-3 min. 50 ≈ 10 seconds at 5 tps. Set 0 to disable.",
+        "ema_warmup_ticks": 50,
+
+        "_comment_spoof": "spoof_dampener_strength: fraction of conviction reduced when spoofing_suspicion=1. Set 0.0 to disable while validating spoof detector. spoof_max_delta_qty: pulls above this share count are treated as institutional executions, not spoofs (default 0 = OFF). Recommended 10000 for Nifty50 large caps.",
         "spoof_dampener_strength": 0.5,
+        "spoof_max_delta_qty": 0,
+
+        "_comment_aggressor_window": "Rolling window (seconds) for buy-vs-sell aggressor volume ratio. Default 5.0. Shorten to 2.0 in slow afternoon markets so old institutional prints don't poison the ratio.",
+        "aggressor_window_s": 5.0,
+
+        "_comment_iceberg_hold": "±bps window around a tracked level within which a trade counts as 'near' the iceberg. Default 5.0. Widen to 10.0 to catch fast sweeps that jump multiple ticks in one event.",
+        "iceberg_price_hold_bps": 5.0,
+
+        "_comment_kill_switch": "Kill-switch triggers when spread exceeds median × N. Default 3.0. Set 2.0 for tighter fast-market protection.",
         "kill_switch_spread_multiplier": 3.0
     }
 }

@@ -22,9 +22,20 @@
 #     bash SETUP.sh --service-stop     systemctl stop
 #     bash SETUP.sh --uninstall-service Remove systemd unit
 #
-#   Pass-through to analyzer:
+#   Pass-through to analyzer (baseline hardening):
 #     bash SETUP.sh --full -- --strong-only --entry-confirmation-sec 15
 #     bash SETUP.sh --full -- --min-rvol 1.5 --session-filter
+#
+#   Pass-through — recent fixes (regime gate, EMA warmup, weight overrides):
+#     bash SETUP.sh --full -- --regime-gate --skip-weak
+#     bash SETUP.sh --full -- --regime-invert                 # contrarian mode
+#     bash SETUP.sh --full -- --ema-warmup-ticks 50           # 9:15 AM cold-start fix
+#     bash SETUP.sh --full -- --w-iceberg 1.0                 # enable hidden-liquidity signal
+#     bash SETUP.sh --full -- --spoof-max-delta-qty 10000     # protect large-cap trades
+#     bash SETUP.sh --full -- --aggressor-window-sec 2.0      # slow-market fix
+#
+#   Post-hoc audit (no config / network needed):
+#     bash SETUP.sh --run -- --verify-horizons logs/hit_rate_predictions.jsonl
 #
 
 set -e
@@ -91,13 +102,43 @@ MODES (default: install + 15-min diagnostic run)
 
   --help                Show this
 
-EXAMPLES
+EXAMPLES — basic
   bash SETUP.sh                               First-time install + diagnostic
   bash SETUP.sh --full                        Full trading day run
   bash SETUP.sh --run                         Launch analyzer, skip install
-  bash SETUP.sh --full -- --strong-only       Full day, STRONG signals only
   bash SETUP.sh --engine-demo                 Verify engine works (no broker)
   bash SETUP.sh --install-service             Enable systemd auto-start
+
+EXAMPLES — signal quality
+  bash SETUP.sh --full -- --strong-only                    # STRONG signals only
+  bash SETUP.sh --full -- --skip-weak                      # skip WEAK (noise)
+  bash SETUP.sh --full -- --entry-confirmation-sec 15      # 15s sniper policy
+  bash SETUP.sh --full -- --min-rvol 1.5 --session-filter  # volume + session gates
+
+EXAMPLES — regime + contrarian (opt-in, address 'LONG loses / SHORT loses')
+  bash SETUP.sh --full -- --regime-gate                    # skip RANDOM regime
+  bash SETUP.sh --full -- --regime-invert                  # flip LONG/SHORT in MR
+
+EXAMPLES — engine tuning (address user-reported concerns)
+  bash SETUP.sh --full -- --ema-warmup-ticks 50            # 9:15 AM cold start fix
+  bash SETUP.sh --full -- --w-iceberg 1.0                  # enable hidden-liquidity
+  bash SETUP.sh --full -- --spoof-max-delta-qty 10000      # protect block trades
+  bash SETUP.sh --full -- --aggressor-window-sec 2.0       # slow-market volume
+  bash SETUP.sh --full -- --kill-switch-spread-mult 2.0    # tighter fast-market
+
+EXAMPLES — combined production preset (all recommended hardening at once)
+  bash SETUP.sh --full -- \\
+      --strong-only \\
+      --entry-confirmation-sec 15 \\
+      --regime-gate \\
+      --ema-warmup-ticks 50 \\
+      --w-iceberg 1.0 \\
+      --kill-switch-spread-mult 2.0 \\
+      --min-rvol 1.2 \\
+      --session-filter
+
+EXAMPLES — post-hoc audit
+  bash SETUP.sh --run -- --verify-horizons logs/hit_rate_predictions.jsonl
 HELP
             exit 0 ;;
         --)
@@ -515,7 +556,18 @@ WorkingDirectory=${REPO_DIR}
 Environment="PATH=${REPO_DIR}/venv/bin:/usr/local/bin:/usr/bin:/bin"
 
 # Full trading day headless (analyzer auto-stops at 15:30 IST daily).
-# Extra flags below apply the 15-second sniper policy by default.
+# Baseline production flags below combine:
+#   * 15-second sniper policy (entry confirmation + survival exit)
+#   * EMA warmup (fixes 9:15 AM Cold-Start Trap)
+#   * Stale-feed guard for systemd restart-on-hang
+#
+# NOT enabled by default (uncomment / add if your data supports it):
+#   --regime-gate                 skip signals in RANDOM regime
+#   --regime-invert               contrarian in MEAN_REVERTING
+#   --w-iceberg 1.0               include hidden-liquidity signal
+#   --spoof-max-delta-qty 10000   protect large-cap block trades
+#   --kill-switch-spread-mult 2.0 tighter fast-market protection
+#   --min-rvol 1.2 --session-filter  volume + session hygiene
 ExecStart=${REPO_DIR}/venv/bin/python3 ${REPO_DIR}/live_hit_rate_analyzer.py \\
     --config ${REPO_DIR}/config.json \\
     --duration-hours 6.5 \\
@@ -526,6 +578,7 @@ ExecStart=${REPO_DIR}/venv/bin/python3 ${REPO_DIR}/live_hit_rate_analyzer.py \\
     --entry-evidence 30 \\
     --survival-check-sec 15 \\
     --survival-min-favor-pct 0.0001 \\
+    --ema-warmup-ticks 50 \\
     --stale-feed-sec 90 \\
     --log-path ${LOG_DIR}/hit_rate_predictions.jsonl \\
     --report-path ${LOG_DIR}/hit_rate_report.txt

@@ -932,6 +932,34 @@ class EngineConfig:
     spoof_pull_threshold_pct: float = 0.4
     spoof_pull_window_s:      float = 1.5
 
+    # -- Aggressor volume window (addressed scan-3 concern that a flat
+    #    5-second sum over-weights stale volume in slow markets). --
+    # Length of the rolling window over which buy-side vs sell-side
+    # aggressor volume is summed to compute `buyer_aggressor_ratio_5s`.
+    # Field name keeps the 5s suffix on the metric for backwards compat
+    # with existing JSONL logs, but the actual window is tunable here.
+    #
+    # 5.0s default — matches the historical hardcoded value.
+    # 2.0s recommended for slow / afternoon markets where a single old
+    #   institutional trade otherwise poisons the ratio for seconds.
+    # 10.0s for very illiquid symbols where you want more samples.
+    aggressor_window_s:       float = 5.0
+
+    # -- Absolute-qty ceiling for pull events (added after user scan-3
+    #    feedback that large-cap block trades were misidentified as
+    #    spoofs). --
+    # If the pull's ABSOLUTE delta_qty exceeds this many shares in one
+    # tick, we treat it as an institutional execution and DO NOT append
+    # to the pull-events buffer. Reasoning: spoofers rarely park
+    # >>10 000 shares because of the tail risk of accidental fills —
+    # a 25 000-share drop in one tick is far more likely a real trade.
+    #
+    # Default 0 = disabled (current behaviour, backwards compat).
+    # Recommended calibration on live NSE data: 10 000 shares for
+    # large-cap Nifty50 stocks; leave at 0 for small/mid-caps where
+    # 25k+ pulls are genuinely rare.
+    spoof_max_delta_qty:      int = 0
+
     # -- Iceberg detector --
     # An "iceberg" here means a level that keeps refilling to roughly the
     # same visible size after nearby executions — implying real hidden
@@ -1122,9 +1150,11 @@ class BookDynamicsEngine:
 
         # -- Aggressor (Lee-Ready tick rule) rolling 5s accumulators --
         # Volume attributed to buyer vs seller initiation over the last
-        # 5 seconds. Ratio feeds into the composite score.
-        self._buy_vol_5s   = TimeSeriesBuffer(5.0)
-        self._sell_vol_5s  = TimeSeriesBuffer(5.0)
+        # aggressor_window_s seconds. Ratio feeds into the composite score.
+        # Window is configurable — shorten to 2s in slow markets so old
+        # institutional prints don't drown out fresh momentum.
+        self._buy_vol_5s   = TimeSeriesBuffer(self.config.aggressor_window_s)
+        self._sell_vol_5s  = TimeSeriesBuffer(self.config.aggressor_window_s)
         self._last_agg_side: AggressorSide = AggressorSide.NA
 
         # -- Market-data ordering guard state --
@@ -1638,6 +1668,14 @@ class BookDynamicsEngine:
                     continue
                 pull_ratio = delta / prev_q
                 if pull_ratio >= self.config.spoof_pull_threshold_pct:
+                    # Skip institutional-sized pulls when the operator
+                    # opted into the absolute-qty ceiling. Spoofers
+                    # almost never park more than ~10k shares (fill
+                    # risk); a 25k-share pull is far more likely an
+                    # actual execution than a fake-liquidity cancel.
+                    if (self.config.spoof_max_delta_qty > 0 and
+                            delta >= self.config.spoof_max_delta_qty):
+                        continue
                     self._pull_events.append({
                         "ts": now,
                         "side": side,
@@ -2614,12 +2652,29 @@ def load_config(path: str) -> ScannerConfig:
 
     ec = data.get("engine", {})
     if ec:
-        # Only override defined fields
+        # Only override defined fields. Any new engine tunable added over
+        # time should be appended here so users can set it via config.json
+        # in addition to the CLI flag.
         ecfg = cfg.engine_config
         for fld in [
+            # Original tunables
             "history_seconds", "depth_decay_frac", "ema_alpha",
             "threshold_strong", "threshold_normal", "threshold_weak",
             "spoof_dampener_strength", "kill_switch_spread_multiplier",
+            # Feature weights (added after user scan-2 feedback)
+            "w_l1_imbalance", "w_top5_imbalance", "w_weighted_depth",
+            "w_book_wide_imbalance", "w_imbalance_roc", "w_liquidity_flow",
+            "w_aggressor_ratio", "w_mid_response", "w_iceberg",
+            # Regime gate (opt-in — see EngineConfig docstring)
+            "regime_gate_enabled", "regime_invert_mean_reverting",
+            # EMA cold-start warmup (fixes 9:15 AM trap)
+            "ema_warmup_ticks",
+            # Spoof detection absolute-qty ceiling
+            "spoof_max_delta_qty",
+            # Aggressor volume window (slow-market fix)
+            "aggressor_window_s",
+            # Iceberg detection window
+            "iceberg_price_hold_bps",
         ]:
             if fld in ec:
                 setattr(ecfg, fld, type(getattr(ecfg, fld))(ec[fld]))
@@ -6733,6 +6788,22 @@ Examples:
                         "Widen to 10.0 to catch fast sweeps that jump "
                         "multiple ticks in one event.")
 
+    # -- Spoof detection absolute-qty ceiling (large-cap block-trade fix) --
+    p.add_argument("--spoof-max-delta-qty", type=int, default=None,
+                   help="Above this many shares in a single-tick pull, we "
+                        "treat the drop as an institutional execution "
+                        "(NOT a spoof) and skip it. Default 0 = disabled. "
+                        "Recommended 10000 for large-cap Nifty50 stocks; "
+                        "leave at 0 for small/mid-caps where 25k+ pulls "
+                        "are genuinely rare.")
+
+    # -- Aggressor window (slow-market volume-decay fix) --
+    p.add_argument("--aggressor-window-sec", type=float, default=None,
+                   help="Length of the rolling window (seconds) used to sum "
+                        "buy-vs-sell aggressor volume. Default 5.0. "
+                        "Shorten to 2.0 in slow afternoon markets so old "
+                        "institutional prints don't poison the ratio.")
+
     # -- Signal state filter (which states to record) --
     p.add_argument("--strong-only", action="store_true",
                    help="Record ONLY STRONG_LONG + STRONG_SHORT signals. "
@@ -7007,6 +7078,12 @@ def main() -> int:
     if args.iceberg_hold_bps is not None:
         engine_config.iceberg_price_hold_bps = args.iceberg_hold_bps
         threshold_overrides.append(f"iceberg_hold_bps={args.iceberg_hold_bps}")
+    if args.spoof_max_delta_qty is not None:
+        engine_config.spoof_max_delta_qty = args.spoof_max_delta_qty
+        threshold_overrides.append(f"spoof_max_delta_qty={args.spoof_max_delta_qty}")
+    if args.aggressor_window_sec is not None:
+        engine_config.aggressor_window_s = args.aggressor_window_sec
+        threshold_overrides.append(f"aggressor_window={args.aggressor_window_sec}s")
         threshold_overrides.append(f"ema_alpha={args.ema_alpha}")
 
     logger.info(f"  Score thresholds: STRONG≥{engine_config.threshold_strong}, "

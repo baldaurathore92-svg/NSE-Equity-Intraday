@@ -779,12 +779,15 @@ class EngineConfig:
     kill_switch_spread_lookback_s: float = 30.0
 
     # -- Spoofing suspicion detector --
-    # spoof_pull_threshold_pct: fraction of a level's quantity that must
-    #   be pulled in a single tick for that pull to count as a spoof event.
-    # spoof_pull_window_s: rolling window over which recent pulls sum up
-    #   into the current spoofing_suspicion score.
     spoof_pull_threshold_pct: float = 0.4
     spoof_pull_window_s:      float = 1.5
+    # Absolute-qty ceiling for pull events. Pulls with delta above this
+    # are treated as institutional executions, not spoofs (default 0 = OFF).
+    spoof_max_delta_qty:      int = 0
+
+    # Rolling window (seconds) for buy-vs-sell aggressor volume sum.
+    # Shorten to 2.0 in slow markets to avoid stale-volume poisoning.
+    aggressor_window_s:       float = 5.0
 
     # -- Iceberg detector --
     # An "iceberg" here means a level that keeps refilling to roughly the
@@ -958,9 +961,9 @@ class BookDynamicsEngine:
 
         # -- Aggressor (Lee-Ready tick rule) rolling 5s accumulators --
         # Volume attributed to buyer vs seller initiation over the last
-        # 5 seconds. Ratio feeds into the composite score.
-        self._buy_vol_5s   = TimeSeriesBuffer(5.0)
-        self._sell_vol_5s  = TimeSeriesBuffer(5.0)
+        # aggressor_window_s seconds. Configurable via EngineConfig.
+        self._buy_vol_5s   = TimeSeriesBuffer(self.config.aggressor_window_s)
+        self._sell_vol_5s  = TimeSeriesBuffer(self.config.aggressor_window_s)
         self._last_agg_side: AggressorSide = AggressorSide.NA
 
         # -- Market-data ordering guard state --
@@ -1474,6 +1477,11 @@ class BookDynamicsEngine:
                     continue
                 pull_ratio = delta / prev_q
                 if pull_ratio >= self.config.spoof_pull_threshold_pct:
+                    # Skip institutional-sized pulls: a 25k-share drop in
+                    # one tick is almost certainly an execution, not a spoof.
+                    if (self.config.spoof_max_delta_qty > 0 and
+                            delta >= self.config.spoof_max_delta_qty):
+                        continue
                     self._pull_events.append({
                         "ts": now,
                         "side": side,
@@ -3786,6 +3794,13 @@ Examples:
     p.add_argument("--iceberg-hold-bps", type=float, default=None,
                    help="±bps window around iceberg level (default 5.0). "
                         "Widen to 10.0 for fast sweeps.")
+    p.add_argument("--spoof-max-delta-qty", type=int, default=None,
+                   help="Pull events above this delta_qty are treated as "
+                        "institutional executions and skipped (default 0 "
+                        "= disabled). Recommended 10000 for Nifty50.")
+    p.add_argument("--aggressor-window-sec", type=float, default=None,
+                   help="Aggressor volume window in seconds (default 5.0). "
+                        "Shorten to 2.0 in slow markets.")
 
     # -- Signal state filter --
     p.add_argument("--strong-only", action="store_true",
@@ -3950,6 +3965,12 @@ def main() -> int:
     if args.iceberg_hold_bps is not None:
         engine_config.iceberg_price_hold_bps = args.iceberg_hold_bps
         logger.info(f"  Iceberg window  : ±{args.iceberg_hold_bps:.1f} bps")
+    if args.spoof_max_delta_qty is not None:
+        engine_config.spoof_max_delta_qty = args.spoof_max_delta_qty
+        logger.info(f"  Spoof max delta : {args.spoof_max_delta_qty:,} shares")
+    if args.aggressor_window_sec is not None:
+        engine_config.aggressor_window_s = args.aggressor_window_sec
+        logger.info(f"  Aggressor window: {args.aggressor_window_sec:.1f}s")
 
     # Determine allowed state set
     if args.strong_only:
