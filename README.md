@@ -7,6 +7,33 @@
 
 ---
 
+## 🎯 वर्तमान Focus — Single-file Live Hit Rate Analyzer
+
+अब यह repo सिर्फ एक tool पर focused है: **`live_hit_rate_analyzer.py`**।
+`paper_trader.py`, `live_dual_analyzer.py`, `tick_recorder.py`,
+`historical_backtest.py`, `COMPARE.sh` और `RECREATE_PROMPT.md` हटा दिए गए हैं।
+
+### Runtime पर सिर्फ इन files की ज़रूरत है
+
+- `live_hit_rate_analyzer.py` — CLI + rich UI + measurement engine
+- `nse_book_scanner.py` — BookDynamicsEngine, Angel One WS adapter, session/RVOL gates
+- `config.json` (users creates from `config.example.json`)
+- `SETUP.sh` — one-command install + launch
+
+### One-command run
+
+```bash
+bash SETUP.sh --full -- --strong-only \
+    --entry-confirmation-sec 15 \
+    --survival-check-sec 15 --survival-min-favor-pct 0.0001
+```
+
+नीचे बाकी दस्तावेज़ historical reference के तौर पर बना हुआ है; कुछ command
+examples (paper_trader / tick_recorder / historical_backtest वाले) अब उपलब्ध
+नहीं हैं और सिर्फ पुराने architecture का हवाला हैं।
+
+---
+
 ## 🏗️ Architecture
 
 ```
